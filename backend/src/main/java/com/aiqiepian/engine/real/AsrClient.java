@@ -32,33 +32,59 @@ public class AsrClient {
     private final SettingsService settings;
 
     private volatile Boolean availableCache;
+    /** 探活成功的解释器（配置项留空时逐个试 PATH 上的 python/py），进程内缓存 */
+    private volatile String pythonCache;
+    /** 上次探活时生效的 asr_python 值：改了设置就重新探，不用重启进程 */
+    private volatile String probeKey;
 
     public boolean enabled() {
         return settings.getBool("asr_enabled", true);
     }
 
-    /** 探活（缓存）：python 能 import faster_whisper。失败则本次进程内不再尝试。 */
+    /** 探活：有能 import faster_whisper 的 python。结果按 asr_python 设置值缓存。 */
     public boolean available() {
         if (!enabled()) return false;
-        Boolean c = availableCache;
-        if (c != null) return c;
-        synchronized (this) {
-            if (availableCache != null) return availableCache;
-            String py = settings.getStr("asr_python", "python");
-            List<String> cmd = List.of(py, "-c", "import faster_whisper");
-            StringBuilder err = new StringBuilder();
-            int code = FfmpegSupport.run(cmd, 60, err);
-            availableCache = code == 0;
-            if (!availableCache) {
-                log.warn("ASR 探活失败（python -c import faster_whisper exit={}）：{}；渲染将只保留标题条",
-                        code, err.toString().trim());
-            }
-            return availableCache;
-        }
+        probeIfChanged();
+        return Boolean.TRUE.equals(availableCache);
     }
 
-    public void invalidate() {
-        availableCache = null;
+    /**
+     * 可用的 ASR 解释器：优先设置项 asr_python，其次 PATH 上的 python、py。
+     * 判定标准是能否 import faster_whisper；全部失败返回 null。
+     */
+    private String workingPython() {
+        probeIfChanged();
+        return pythonCache;
+    }
+
+    private void probeIfChanged() {
+        String cfg = settings.getStr("asr_python", "").trim();
+        if (cfg.equals(probeKey)) return;
+        synchronized (this) {
+            if (cfg.equals(probeKey)) return;
+            availableCache = null;
+            pythonCache = null;
+            List<String> candidates = new ArrayList<>();
+            if (!cfg.isEmpty()) candidates.add(cfg);
+            candidates.add("python");
+            candidates.add("py");
+            for (String cand : candidates) {
+                StringBuilder err = new StringBuilder();
+                int code = FfmpegSupport.run(List.of(cand, "-c", "import faster_whisper"), 60, err);
+                if (code == 0) {
+                    pythonCache = cand;
+                    availableCache = true;
+                    log.info("ASR 解释器就绪: {}", cand);
+                    break;
+                }
+                log.info("ASR 解释器不可用（{}，exit={}）：{}", cand, code, err.toString().trim());
+            }
+            if (!Boolean.TRUE.equals(availableCache)) {
+                availableCache = false;
+                log.warn("未找到可用的 ASR 解释器（需在设置页填 asr_python，或让 PATH 上的 python 装上 faster-whisper）；渲染将只保留标题条");
+            }
+            probeKey = cfg;
+        }
     }
 
     /**
@@ -89,7 +115,7 @@ public class AsrClient {
             }
 
             // 2) python 转写 → SRT
-            String py = settings.getStr("asr_python", "python");
+            String py = workingPython();
             String script = settings.getStr("asr_script", defaultScript());
             List<String> cmd = new ArrayList<>(List.of(
                     py, script,
@@ -172,7 +198,7 @@ public class AsrClient {
             Path dir = Path.of(settings.getStr("media_dir", "./media"), "subtitles");
             Files.createDirectories(dir);
             tl = Files.createTempFile(dir, "speech_", ".tsv");
-            String py = settings.getStr("asr_python", "python");
+            String py = workingPython();
             String script = settings.getStr("asr_script", defaultScript());
             List<String> cmd = new ArrayList<>(List.of(
                     py, script,

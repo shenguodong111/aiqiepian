@@ -600,6 +600,92 @@ const server = http.createServer(async (req, res) => {
     db.rooms = []; db.sessions = []; db.clips = []; db.works = []; db.reviews = []; db.publishes = []; db.jobs = []; db.compilations = []; db.account = null
     return ok(res, true)
   }
+  // 跨机迁移：配置导出 / 导入（与 Spring 端 /api/config/* 同契约；B 站 Cookie 等凭据一律剔除）
+  const CFG_OMIT = ['bili_sessdata', 'bili_jct', 'bili_uid', 'bili_browser_cookie', 'engine_mode']
+  const cfgRoom = r => ({
+    platform: r.platform, room_url: r.room_url, room_name: r.room_name || '', anchor_name: r.anchor_name || '',
+    live_title: r.live_title || '', monitor_enabled: r.monitor_enabled ?? true, auto_record: r.auto_record ?? true,
+    auto_publish: r.auto_publish ?? true, analyze_template: r.analyze_template || 'highlight',
+  })
+  const urlOf = roomId => db.rooms.find(r => r.id === roomId)?.room_url || ''
+  const toCfgRow = (row, extra) => {
+    const copy = { ...row, src_id: row.id }
+    delete copy.id; delete copy.room_id
+    return { ...copy, ...extra }
+  }
+  if (api === '/config/export' && req.method === 'GET') {
+    const payload = {
+      kind: 'aiqiepian-config', version: 1, exported_at: now(),
+      rooms: db.rooms.map(cfgRoom),
+      settings: Object.fromEntries(Object.entries(db.settings).filter(([k]) => !CFG_OMIT.includes(k))),
+    }
+    if (q.include_history === 'true') {
+      payload.history = {
+        recordings: db.sessions.map(s => toCfgRow(s, { room_url: urlOf(s.room_id) })),
+        clips: db.clips.map(c => toCfgRow(c, { room_url: urlOf(db.sessions.find(s => s.id === c.session_id)?.room_id), src_session_id: c.session_id })),
+        works: db.works.map(w => {
+          const c = db.clips.find(x => x.id === w.clip_id)
+          const s = c && db.sessions.find(x => x.id === c.session_id)
+          return toCfgRow(w, { room_url: urlOf(s?.room_id), src_clip_id: w.clip_id })
+        }),
+      }
+    }
+    return ok(res, payload)
+  }
+  if (api === '/config/import' && req.method === 'POST') {
+    if (body?.kind !== 'aiqiepian-config') return err(res, '文件格式不对：这不是本工具导出的配置 JSON')
+    if ((body.version || 1) > 1) return err(res, `配置版本过新（文件 v${body.version}，本机 v1），请先升级程序再导入`)
+    const r = { rooms_created: 0, rooms_updated: 0, settings_updated: 0 }
+    for (const item of body.rooms || []) {
+      if (!item.room_url) continue
+      const cfg = cfgRoom(item)
+      const exist = db.rooms.find(x => x.room_url === item.room_url)
+      if (exist) { Object.assign(exist, cfg, { updated_at: now() }); r.rooms_updated++ }
+      else {
+        db.rooms.push({ id: nid(), ...cfg, status: cfg.monitor_enabled ? 'MONITORING' : 'OFF', last_live_at: null, created_at: now(), updated_at: now() })
+        r.rooms_created++
+      }
+    }
+    const patch = Object.fromEntries(Object.entries(body.settings || {}).filter(([k]) => !CFG_OMIT.includes(k)))
+    Object.assign(db.settings, patch)
+    r.settings_updated = Object.keys(patch).length
+    const h = body.history
+    if (h) {
+      const sidMap = {}, cidMap = {}
+      r.recordings_created = 0; r.recordings_skipped = 0
+      for (const s of h.recordings || []) {
+        const room = db.rooms.find(x => x.room_url === s.room_url)
+        if (!room) { r.recordings_skipped++; continue }
+        const dupe = db.sessions.find(x => x.room_id === room.id && x.started_at === s.started_at)
+        if (dupe) { sidMap[s.src_id] = dupe.id; r.recordings_skipped++; continue }
+        const { src_id, room_url, ...rest } = s
+        const row = { ...rest, id: nid(), room_id: room.id, room_name: rest.room_name || room.room_name, platform: rest.platform || room.platform }
+        db.sessions.push(row); sidMap[src_id] = row.id; r.recordings_created++
+      }
+      r.clips_created = 0; r.clips_skipped = 0
+      for (const c of h.clips || []) {
+        const sessionId = sidMap[c.src_session_id] ?? db.sessions.find(s => s.room_id === db.rooms.find(x => x.room_url === c.room_url)?.id)?.id
+        if (!sessionId) { r.clips_skipped++; continue }
+        const dupe = db.clips.find(x => x.session_id === sessionId && x.start_sec === c.start_sec && x.end_sec === c.end_sec)
+        if (dupe) { cidMap[c.src_id] = dupe.id; r.clips_skipped++; continue }
+        const { src_id, src_session_id, room_url, ...rest } = c
+        const row = { ...rest, id: nid(), session_id: sessionId, room_id: db.sessions.find(s => s.id === sessionId).room_id }
+        db.clips.push(row); cidMap[src_id] = row.id; r.clips_created++
+      }
+      r.works_created = 0; r.works_skipped = 0
+      for (const w of h.works || []) {
+        const clipId = cidMap[w.src_clip_id] ?? w.clip_id
+        const clip = db.clips.find(x => x.id === clipId)
+        if (!clip) { r.works_skipped++; continue }
+        const dupe = db.works.find(x => x.clip_id === clipId && x.title === w.title)
+        if (dupe) { r.works_skipped++; continue }
+        const { src_id, src_clip_id, room_url, ...rest } = w
+        db.works.push({ ...rest, id: nid(), clip_id: clipId, room_name: rest.room_name || clip.room_name })
+        r.works_created++
+      }
+    }
+    return ok(res, r)
+  }
   // 队列
   if (api === '/jobs' && req.method === 'GET') {
     let list = [...db.jobs].reverse()

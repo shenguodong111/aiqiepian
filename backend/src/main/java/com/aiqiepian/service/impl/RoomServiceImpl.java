@@ -127,7 +127,7 @@ public class RoomServiceImpl implements RoomService {
         result.put("live", live);
         if (ev.getTitle() != null) result.put("title", ev.getTitle());
         if (live && !recorder.supportsRealRecording(room.getPlatform())) {
-            result.put("note", "该主播正在直播，但本平台真实录制暂未支持（当前仅 B站），本次只做开播检测，不自动录制");
+            result.put("note", "该主播正在直播，但本平台真实录制暂未支持（当前支持 B站/斗鱼/虎牙），本次只做开播检测，不自动录制");
         }
         return result;
     }

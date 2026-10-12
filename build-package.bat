@@ -1,6 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+call env.bat
 
 echo [1/3] Building frontend (Vite)...
 pushd frontend
@@ -14,8 +15,7 @@ mkdir backend\src\main\resources\static
 xcopy /e /i /y frontend\dist backend\src\main\resources\static >nul
 
 echo [3/3] Packaging executable jar...
-set "JAVA_HOME=C:\Program Files\Microsoft\jdk-17.0.20.101-hotspot"
-call "C:\Users\25436\tools\maven-home\apache-maven-3.9.16\bin\mvn.cmd" -s "C:\Users\25436\tools\maven-home\settings.xml" -f backend\pom.xml -o clean package -DskipTests
+call "%AIQIPIAN_MVN%\bin\mvn.cmd" -f backend\pom.xml clean package -DskipTests
 if errorlevel 1 (echo PACKAGE FAILED & pause & exit /b 1)
 
 echo.

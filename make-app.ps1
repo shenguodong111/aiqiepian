@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
-$root = 'C:\Users\25436\Documents\Qoder\2026-10-09\ab87a17e'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ico  = Join-Path $root 'aiqiepian.ico'
 
 # shortcut name "AI 切片" built from unicode code points (script kept ASCII to avoid GBK parse issues)

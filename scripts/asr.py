@@ -72,6 +72,8 @@ def main() -> int:
     ap.add_argument("--language", default="zh")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--compute", default="int8")
+    ap.add_argument("--prompt", default=None,
+                    help="whisper initial_prompt; defaults to a simplified-Chinese cue for language=zh")
     args = ap.parse_args()
 
     if not args.output and not args.timeline_out:
@@ -108,11 +110,14 @@ def main() -> int:
 
     try:
         model = WhisperModel(args.model, device=args.device, compute_type=args.compute)
+        # 中文不设提示时 whisper 常吐繁体，烧进成片里很怪；可用 --prompt 覆盖
+        prompt = args.prompt or ("以下是简体中文的普通话直播解说。" if args.language == "zh" else None)
         segments, info = model.transcribe(
             samples,
             language=(args.language or None),
             beam_size=1,
             vad_filter=True,
+            initial_prompt=prompt,
         )
     except Exception as e:  # noqa: BLE001
         print(f"ERROR transcribe: {e!r}")

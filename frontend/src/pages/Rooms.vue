@@ -6,7 +6,7 @@ import LoadingBlock from '../components/LoadingBlock.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Pagination from '../components/Pagination.vue'
 import Modal from '../components/Modal.vue'
-import { PLATFORMS, ROOM_STATUS, ANALYZE_TEMPLATES, relTime, copyText } from '../utils/format'
+import { PLATFORMS, RECORDABLE_PLATFORMS, ROOM_STATUS, ANALYZE_TEMPLATES, relTime, copyText } from '../utils/format'
 
 const list = ref([])
 const total = ref(0)
@@ -235,9 +235,12 @@ onMounted(load)
     <Modal v-if="modal" :title="modal.room ? '编辑直播间' : '新增直播间'" @close="modal = null">
       <label class="field"><span>平台 *</span>
         <select class="input" v-model="modal.form.platform">
-          <option v-for="(label, k) in PLATFORMS" :key="k" :value="k">{{ label }}</option>
+          <option v-for="(label, k) in PLATFORMS" :key="k" :value="k">{{ label }}{{ RECORDABLE_PLATFORMS.includes(k) ? '' : '（仅检测开播，不自动录制）' }}</option>
         </select>
       </label>
+      <p v-if="!RECORDABLE_PLATFORMS.includes(modal.form.platform)" class="hint" style="margin:-4px 0 10px">
+        该平台尚未接入录制地址解析：监控只会提示「正在直播」，不会自动开录，也不会产出片段。
+      </p>
       <label class="field"><span>直播间 URL *</span>
         <input class="input" v-model="modal.form.room_url" :placeholder="URL_RULES[modal.form.platform]?.hint" />
       </label>

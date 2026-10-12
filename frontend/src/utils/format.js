@@ -55,6 +55,9 @@ export function relTime(iso) {
 
 export const PLATFORMS = { bilibili: 'B站', douyu: '斗鱼', huya: '虎牙', douyin: '抖音' }
 
+/** 真实引擎可开播检测 + 自动录制的平台；其余只能录入存档，不会自动开录 */
+export const RECORDABLE_PLATFORMS = ['bilibili', 'douyu', 'huya']
+
 export const ROOM_STATUS = {
   OFF: { label: '未监控', cls: 'off' },
   IDLE: { label: '空闲', cls: 'idle' },

@@ -13,7 +13,8 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 真实监控（M1）：按平台分发开播检测，附带直播标题。
- * bilibili=get_info；douyu=RoomApi/room（仅检测，录制暂未支持）；其它平台真实模式下视为未开播。
+ * bilibili=get_info；douyu=RoomApi/room；huya=直播页 flv 探测。三者录制均已支持（见 RealRecorder）。
+ * 其它平台（含抖音）真实模式下视为未开播。
  * 带 TTL 缓存（默认 5s），避免 3s tick 对同一房间重复打接口；manual=true 强制刷新。
  */
 @Component

@@ -68,16 +68,17 @@ const form = reactive({
 const keyMasked = ref('')
 
 const AI_MODES = [
-  { key: 'local', label: '本地模型', desc: '本机 Ollama / OpenAI 兼容大模型：高光重排、弹幕摘要、投稿文案' },
-  { key: 'agent', label: 'Agent 工具', desc: '通过本地 Agent CLI 调用分析能力' },
-  { key: 'cloud', label: '云端 API', desc: 'OpenAI 兼容的云端推理接口' },
+  { key: 'local', label: '本地模型', desc: '本机 Ollama / OpenAI 兼容大模型：高光重排、弹幕摘要、投稿文案', ready: true },
+  { key: 'agent', label: 'Agent 工具', desc: '后端尚未实现，选中不会生效', ready: false },
+  { key: 'cloud', label: '云端 API', desc: '后端尚未实现，选中不会生效', ready: false },
 ]
 
 async function load() {
   try {
     const s = await http.get('/settings')
     Object.keys(form).forEach(k => { if (s[k] !== undefined && s[k] !== null) form[k] = s[k] })
-    if (form.ai_mode === 'mock') form.ai_mode = ''
+    // agent/cloud 后端未实现，历史上可能被存过：统一回落到内置规则
+    if (form.ai_mode !== 'local') form.ai_mode = ''
     keyMasked.value = s.ai_cloud_key ? `****${String(s.ai_cloud_key).slice(-4)}` : ''
     const sys = await http.get('/dashboard/summary', null, { silent: true })
     if (sys?.system?.engine_version) version.value = sys.system.engine_version
@@ -107,6 +108,57 @@ async function resetDemo() {
   } catch { /* http 已 toast */ }
 }
 
+/* ---- 跨机迁移：导出/导入配置 JSON ---- */
+const exporting = ref(false)
+const includeHistory = ref(false)
+const importModal = ref(false)
+const importing = ref(false)
+const importPayload = ref(null)
+const importInfo = ref(null)
+const importResult = ref(null)
+
+async function doExport() {
+  exporting.value = true
+  try {
+    const data = await http.get('/config/export', { include_history: includeHistory.value ? 'true' : undefined })
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `aiqiepian-配置-${new Date().toISOString().slice(0, 10)}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+    toast.success('已导出配置 JSON，把它拷到另一台电脑导入即可（不含 B 站 Cookie）')
+  } catch { /* http 已 toast */ } finally { exporting.value = false }
+}
+
+function pickImport(ev) {
+  const file = ev.target.files?.[0]
+  ev.target.value = ''
+  if (!file) return
+  file.text().then(txt => {
+    let data
+    try { data = JSON.parse(txt) } catch { return toast.error('这个文件不是合法的 JSON') }
+    if (data?.kind !== 'aiqiepian-config') return toast.error('文件格式不对：请选择本工具导出的配置 JSON')
+    importPayload.value = data
+    importInfo.value = {
+      exported_at: String(data.exported_at || '').slice(0, 19).replace('T', ' '),
+      rooms: (data.rooms || []).length,
+      history: data.history ? Object.values(data.history).reduce((n, arr) => n + (arr?.length || 0), 0) : 0,
+    }
+    importResult.value = null
+    importModal.value = true
+  })
+}
+
+async function doImport() {
+  importing.value = true
+  try {
+    importResult.value = await http.post('/config/import', importPayload.value)
+    toast.success('导入完成，直播间与设置已更新')
+    loadSettings(true)
+  } catch { /* http 已 toast */ } finally { importing.value = false }
+}
+
 onMounted(load)
 </script>
 
@@ -134,12 +186,13 @@ onMounted(load)
 
         <!-- AI 接入 -->
         <div class="card group">
-          <div class="group-title">AI 接入 <span class="badge cyan" style="margin-left: 8px">{{ form.ai_mode === 'local' ? '本地大模型' : form.ai_mode === 'agent' ? 'Agent 工具' : form.ai_mode === 'cloud' ? '云端 API' : '模拟执行中' }}</span></div>
+          <div class="group-title">AI 接入 <span class="badge cyan" style="margin-left: 8px">{{ form.ai_mode === 'local' ? '本地大模型' : '内置规则引擎' }}</span></div>
           <div class="radio-row">
-            <label v-for="m in AI_MODES" :key="m.key" class="radio-card" :class="{ active: form.ai_mode === m.key }">
-              <input type="radio" :value="m.key" v-model="form.ai_mode" />
+            <label v-for="m in AI_MODES" :key="m.key" class="radio-card"
+              :class="{ active: form.ai_mode === m.key, disabled: !m.ready }">
+              <input type="radio" :value="m.key" v-model="form.ai_mode" :disabled="!m.ready" />
               <div>
-                <div style="font-weight: 600; font-size: 13px">{{ m.label }}</div>
+                <div style="font-weight: 600; font-size: 13px">{{ m.label }}<span v-if="!m.ready" class="badge">后端未实现</span></div>
                 <div class="hint" style="font-size: 11.5px">{{ m.desc }}</div>
               </div>
             </label>
@@ -147,18 +200,9 @@ onMounted(load)
           <template v-if="form.ai_mode === 'local'">
             <label class="field"><span>推理服务 URL</span><input class="input" v-model="form.ai_local_url" placeholder="http://127.0.0.1:11434" /></label>
             <label class="field"><span>模型名称</span><input class="input" v-model="form.ai_local_model" placeholder="qwen2.5:3b" /></label>
+            <p class="hint">需本机已启动 Ollama 并拉好该模型；连不上时程序不会报错中断，会自动退回内置规则模板生成标题/简介。</p>
           </template>
-          <template v-else-if="form.ai_mode === 'agent'">
-            <label class="field"><span>Agent 命令 / 入口</span><input class="input" v-model="form.ai_agent_cmd" placeholder="agent-cli analyze --session" /></label>
-          </template>
-          <template v-else-if="form.ai_mode === 'cloud'">
-            <label class="field"><span>API URL</span><input class="input" v-model="form.ai_cloud_url" placeholder="https://api.example.com/v1" /></label>
-            <label class="field"><span>模型名</span><input class="input" v-model="form.ai_cloud_model" placeholder="gemini-2.0-flash" /></label>
-            <label class="field"><span>API Key（不回显明文）</span>
-              <input class="input" type="password" v-model="form.ai_cloud_key" :placeholder="keyMasked ? `已保存（${keyMasked}），输入将覆盖` : 'sk-…'" />
-            </label>
-          </template>
-          <p v-else class="hint">本期由 Mock 引擎驱动管线，M1–M3 起接入真实实现；选择模式仅保存配置。</p>
+          <p v-else class="hint">不接大模型也能跑：标题用「房间名 + 战队 VS + 时刻」或高频弹幕汇总规则生成，简介用设置里的模板填充。想升级为本地大模型精修，选上方「本地模型」并填 URL。</p>
         </div>
 
         <!-- 语音字幕 ASR -->
@@ -173,7 +217,8 @@ onMounted(load)
             <label class="field"><span>识别模型</span><input class="input" v-model="form.asr_model" placeholder="small" /></label>
             <label class="field"><span>语言</span><input class="input" v-model="form.asr_language" placeholder="zh" /></label>
           </div>
-          <label class="field"><span>Python 路径（含 faster-whisper 解释器）</span><input class="input" v-model="form.asr_python" placeholder="python" /></label>
+          <label class="field"><span>Python 解释器（可选）</span><input class="input" v-model="form.asr_python" placeholder="留空 = 自动探测 PATH 上的 python / py" /></label>
+          <p class="hint">需要本机装有 faster-whisper。留空时程序会自己试 python、py 两个命令；装在别处就填完整的 python.exe 路径。</p>
         </div>
 
         <!-- 高光集锦自动成片 -->
@@ -193,6 +238,22 @@ onMounted(load)
           <label class="field"><span>保留天数（到期模拟清理）</span><input class="input num" type="number" min="1" v-model.number="form.keep_days" /></label>
           <p class="hint">单机版数据保存在本机磁盘，路径相对于程序运行目录。</p>
           <button class="btn" style="margin-top: 12px" @click="cleanModal = true">🧹 一键清理冗余片段 / 作品</button>
+        </div>
+
+        <!-- 跨机迁移 -->
+        <div class="card group">
+          <div class="group-title">跨机迁移 <span class="hint" style="font-weight: 400">换电脑时搬直播间和设置</span></div>
+          <p class="hint">导出的是一份 JSON 文本文件，拷到 U 盘 / 传微信都行，在新电脑的设置页导入即可还原。
+            <b>B 站 Cookie 属于登录凭证，永远不会被写进导出文件</b>，新机器需要重新粘贴一次。</p>
+          <label class="check-line" style="margin: 10px 0 4px">
+            <label class="switch"><input type="checkbox" v-model="includeHistory" /><span class="track"></span></label>
+            <span>包含录制历史（会话 / 片段 / 作品记录；视频文件本身不在导出内）</span>
+          </label>
+          <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px">
+            <button class="btn primary" :disabled="exporting" @click="doExport">{{ exporting ? '导出中…' : '导出配置 JSON' }}</button>
+            <button class="btn" @click="$refs.importFileInput.click()">选择配置文件导入…</button>
+          </div>
+          <input ref="importFileInput" type="file" accept=".json,application/json" style="display: none" @change="pickImport" />
         </div>
 
         <!-- 发布 -->
@@ -245,6 +306,37 @@ onMounted(load)
       </div>
     </Modal>
 
+    <Modal v-if="importModal" title="导入配置" @close="!importing && (importModal = false)">
+      <template v-if="!importResult">
+        <p style="margin-bottom: 8px">这份配置来自 <b class="num">{{ importInfo?.exported_at || '未知时间' }}</b>，将执行：</p>
+        <ul class="reset-list">
+          <li><b>{{ importInfo?.rooms || 0 }}</b> 个直播间：同 URL 的覆盖配置，新的直接添加（本机已有的其它房间不受影响）</li>
+          <li>设置项按文件内容更新；<b>B 站 Cookie 不在文件里，会保持本机现有值</b></li>
+          <li v-if="importInfo?.history">附带 <b class="num">{{ importInfo.history }}</b> 条历史记录（会话/片段/作品），已存在的自动跳过</li>
+        </ul>
+        <p class="hint">{{ importInfo?.history ? '注意：历史记录里的视频文件不在这台电脑上，播放会提示找不到文件。' : '只搬配置，不搬录制历史。' }}</p>
+        <div class="modal-foot">
+          <button class="btn ghost" @click="importModal = false">取消</button>
+          <button class="btn primary" :disabled="importing" @click="doImport">{{ importing ? '导入中…' : '确认导入' }}</button>
+        </div>
+      </template>
+      <template v-else>
+        <p style="margin-bottom: 8px">导入完成：</p>
+        <ul class="reset-list">
+          <li>直播间 新增 {{ importResult.rooms_created }} · 覆盖 {{ importResult.rooms_updated }}</li>
+          <li>设置项更新 {{ importResult.settings_updated }} 条</li>
+          <li v-if="importResult.recordings_created !== undefined">
+            历史：会话 {{ importResult.recordings_created }}（跳过 {{ importResult.recordings_skipped }}）·
+            片段 {{ importResult.clips_created }}（跳过 {{ importResult.clips_skipped }}）·
+            作品 {{ importResult.works_created }}（跳过 {{ importResult.works_skipped }}）
+          </li>
+        </ul>
+        <div class="modal-foot">
+          <button class="btn primary" @click="importModal = false">知道了</button>
+        </div>
+      </template>
+    </Modal>
+
     <Modal v-if="cleanModal" title="一键清理冗余" @close="!cleaning && (cleanModal = false)">
       <p class="hint" style="margin-bottom: 12px">
         每个录制会话<b>只保留评分最高的前 N 个片段</b>，多余的片段连同其作品、审核/发布记录一并删除；可顺带清掉磁盘上数据库已不引用的孤儿文件。
@@ -286,6 +378,8 @@ onMounted(load)
 .radio-card:hover { border-color: var(--border-strong); }
 .radio-card.active { border-color: rgba(12, 143, 161, 0.6); background: var(--accent-soft); }
 .radio-card input { accent-color: var(--accent); }
+.radio-card.disabled { opacity: 0.5; cursor: not-allowed; }
+.radio-card .badge { margin-left: 6px; font-size: 10.5px; vertical-align: 1px; }
 .kv { display: flex; gap: 12px; font-size: 13px; margin-bottom: 8px; align-items: center; }
 .kv .hint { flex: none; width: 76px; }
 .kv .dot { margin-right: 4px; }

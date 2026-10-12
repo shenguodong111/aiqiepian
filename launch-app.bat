@@ -1,9 +1,18 @@
 @echo off
 setlocal
-set "JAVA=C:\Program Files\Microsoft\jdk-17.0.20.101-hotspot\bin\javaw.exe"
-set "BACKEND=C:\Users\25436\Documents\Qoder\2026-10-09\ab87a17e\backend"
+cd /d "%~dp0"
+call env.bat
+set "BACKEND=%~dp0backend"
 set "JAR=%BACKEND%\target\aiqiepian-backend-1.0.0.jar"
 set "URL=http://localhost:8090"
+
+rem Local LLM for AI titles/desc: start Ollama if present and not already running.
+set "OLLAMA=%AIQIPIAN_OLLAMA%"
+if not exist "%OLLAMA%" set "OLLAMA=%LOCALAPPDATA%\Programs\Ollama\ollama.exe"
+if exist "%OLLAMA%" (
+  if not defined OLLAMA_MODELS if exist "%AIQIPIAN_OLLAMA_MODELS%" set "OLLAMA_MODELS=%AIQIPIAN_OLLAMA_MODELS%"
+  tasklist /FI "IMAGENAME eq ollama.exe" 2>nul | find /i "ollama.exe" >nul || start "Ollama" /min "%OLLAMA%" serve
+)
 
 rem If already running, just open the window (no second backend).
 curl -s -o nul "%URL%/api/settings" && goto open
@@ -11,7 +20,7 @@ curl -s -o nul "%URL%/api/settings" && goto open
 if not exist "%JAR%" goto nojar
 
 pushd "%BACKEND%"
-start "" "%JAVA%" -jar "%JAR%" --engine.mode=real --server.port=8090 --logging.file.name=run8090.log
+start "" "%JAVA_HOME%\bin\javaw.exe" -jar "%JAR%" --engine.mode=real --server.port=8090 --logging.file.name=run8090.log
 popd
 
 set /a n=0

@@ -40,8 +40,8 @@ public class SettingsServiceImpl implements SettingsService, ApplicationRunner {
     /** 非设置项的内部 KV 键（不出现在 GET /settings 响应中） */
     public static final String KEY_PUBLISH_ACCOUNT = "publish_account";
 
-    /** M3 敏感设置（Cookie 三件套）：GET 返回时掩码，PUT 收到掩码值不覆盖真实值 */
-    private static final Set<String> SENSITIVE_KEYS = Set.of("bili_sessdata", "bili_jct", "bili_uid", "bili_browser_cookie");
+    /** M3 敏感设置（Cookie 三件套）：GET 返回时掩码，PUT 收到掩码值不覆盖真实值；配置导出时整体剔除 */
+    public static final Set<String> SENSITIVE_KEYS = Set.of("bili_sessdata", "bili_jct", "bili_uid", "bili_browser_cookie");
 
     /** 有序默认设置，键与 server.mjs db.settings 一一对应 */
     private static final Map<String, Object> DEFAULTS = buildDefaults();
@@ -88,7 +88,8 @@ public class SettingsServiceImpl implements SettingsService, ApplicationRunner {
         m.put("ai_local_model", "qwen2.5:3b");
         // ---- 本地语音 ASR 字幕（faster-whisper，engine.mode=real 生效）----
         m.put("asr_enabled", true);
-        m.put("asr_python", "C:/Users/25436/AppData/Local/Programs/Python/Python313/python.exe");
+        // 留空 = AsrClient 逐个探测 PATH 上的 python/py；换机器不需要改这里
+        m.put("asr_python", "");
         m.put("asr_model", "small");
         m.put("asr_language", "zh");
         m.put("asr_device", "cpu");

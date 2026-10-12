@@ -9,10 +9,11 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 /**
- * 真实引擎装配：监控/录制/成片为 engine.real 下的 *Real Bean（自带 @Component 条件），
- * 分析环节 M2 起由 RealAnalyzer（@Component + 同条件）接管，不再注册 mock 占位；
- * 审核/发布仍复用 mock 实现作为占位（不修改 engine/mock 源码，仅在 real 模式下补充注册），
- * 保证六环节接口调用链在 real 模式下完整可跑。
+ * 真实引擎装配：监控/录制/分析/成片为 engine.real 下的 *Real Bean（自带 @Component 条件）。
+ * 审核环节复用 MockReviewer——它并非随机模拟，而是需求 §3.3 第 05 环节的规则审核实现
+ * （敏感词黑名单 + 自动通过/拒绝阈值 + 不确定项交人工），real 模式同样适用。
+ * 发布在此注册 MockPublisher 仅为保证六环节调用链完整，实际注入被
+ * {@link RealPublisher} 的 @Primary 覆盖。
  */
 @Configuration
 @ConditionalOnProperty(name = "engine.mode", havingValue = "real")
