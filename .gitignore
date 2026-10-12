@@ -1,0 +1,35 @@
+# ---- 构建产物 ----
+backend/target/
+frontend/dist/
+frontend/node_modules/
+node_modules/
+# 内嵌前端产物（由 build-package 从 frontend/dist 生成，不入库）
+backend/src/main/resources/static/
+
+# ---- 运行时数据与机密（B站 Cookie 存在 H2 库里，绝不上传）----
+backend/data/
+*.db
+*.mv.db
+*.lock.db
+*.trace.db
+.env
+*.env
+
+# ---- 媒体文件（录制/成片/封面/字幕，体积大且含内容）----
+media/
+backend/media/
+
+# ---- 日志（含 upos 上传 auth token 等）----
+*.log
+logs/
+
+# ---- 桌面应用打包中间产物 ----
+*.jar.original
+
+# ---- 操作系统 / 编辑器 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.iml

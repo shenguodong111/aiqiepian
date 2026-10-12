@@ -1,0 +1,45 @@
+server:
+  # 可被 -Dserver.port 覆盖（Spring 系统属性优先级高于本文件）
+  port: 8080
+
+spring:
+  application:
+    name: aiqiepian-backend
+  datasource:
+    # NON_KEYWORDS=KEY,VALUE：app_setting 表按需求文档 §5 使用 key/value 两列，
+    # 二者是 H2 2.x 保留字，放开为普通标识符以匹配文档命名。
+    url: jdbc:h2:file:./data/aiqiepian;AUTO_SERVER=TRUE;NON_KEYWORDS=KEY,VALUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+  jackson:
+    # 所有 JSON 字段输出 snake_case，与 mock-server 契约完全一致
+    property-naming-strategy: SNAKE_CASE
+    default-property-inclusion: always
+    serialization:
+      write-dates-as-timestamps: false
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+    db-config:
+      id-type: auto
+
+# 引擎模式：mock（本期默认）| real（M1-M3 替换点，新增 *Real Bean 后切换）
+engine:
+  mode: mock
+
+# CORS 允许的前端地址（见 CorsConfig）
+app:
+  cors:
+    allowed-origins: http://localhost:5173
+
+logging:
+  level:
+    com.aiqiepian: info
