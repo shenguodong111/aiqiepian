@@ -6,12 +6,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.core.io.FileSystemResource;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestClientResponseException;
 import org.springframework.web.client.RestTemplate;
@@ -48,6 +51,8 @@ public class BiliClient {
     public static final String PREUPLOAD_URL =
             "https://member.bilibili.com/preupload?probe_version=20221109&upcdn=bda2&zone=cs";
     public static final String WEB_ADD_URL = "https://member.bilibili.com/x/vu/web/add";
+    /** 封面图上传：multipart(cover=图片, csrf)，成功返回 data.url，稿件提交时作为 cover 字段带上 */
+    public static final String COVER_UP_URL = "https://member.bilibili.com/x/vu/web/cover/up";
     public static final String VIEW_URL = "https://api.bilibili.com/x/web-interface/view";
 
     private static final String UA =
@@ -156,7 +161,45 @@ public class BiliClient {
      * upos 上传：preupload 取桶信息 → ?uploads 申请 upload_id → 逐片 PUT（10MB 分片，进度回调 0-100）
      * → complete 提交 parts 拿 location。任一阶段非 0/非 OK 抛 {@link BiliApiException}（原始错误不吞）。
      */
+    /** 整段上传最多尝试次数（每次重新 preupload 换发令牌） */
+    private static final int UPLOAD_ATTEMPTS = 3;
+
+    /**
+     * 整段上传，失败自动重传（最多 {@value #UPLOAD_ATTEMPTS} 次）。
+     *
+     * <p>仅对「分片 PUT(-6)/合并(-8)」重试：本机到 B站 CDN 上行被严重限速（实测约 54KB/s），
+     * 单次 preupload 换发的 {@code X-Upos-Auth} 令牌会在慢速末片落地前过期，表现为末片 403 AccessDenied
+     * （或连接被中止）。重试时重新 preupload 换发新令牌/upload_id 再整段传，可自愈该过期。
+     * 其它错误（Cookie 失效、preupload/init 前置失败）原样抛出不重试，避免无意义重投。
+     */
     public UploadOutcome uploadVideo(File file, String videoName, long mid, IntConsumer percent) {
+        BiliApiException last = null;
+        for (int attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt++) {
+            try {
+                return uploadOnce(file, videoName, percent);
+            } catch (BiliApiException e) {
+                if (e.getCode() != -6 && e.getCode() != -8) throw e;
+                last = e;
+                log.warn("bili 上传第 {}/{} 次失败（{}），重新 preupload 换发令牌后整段重传",
+                        attempt, UPLOAD_ATTEMPTS, e.toErrorMsg());
+                if (attempt < UPLOAD_ATTEMPTS) {
+                    try {
+                        Thread.sleep(2500L * attempt);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }
+        throw last;
+    }
+
+    /**
+     * 单次上传尝试：preupload 取桶信息 → ?uploads 申请 upload_id → 逐片 PUT（10MB 分片，进度回调 0-100）
+     * → complete 提交 parts 拿 location。任一阶段非 0/非 OK 抛 {@link BiliApiException}（原始错误不吞）。
+     */
+    private UploadOutcome uploadOnce(File file, String videoName, IntConsumer percent) {
         long size = file.length();
         // 1) preupload
         String preUrl = PREUPLOAD_URL + "&r=upos&profile=ugcupos%2Fbup&ssl=0&version=2.11.0&build=2110000"
@@ -190,8 +233,10 @@ public class BiliClient {
                 byte[] chunk = new byte[len];
                 raf.seek(off);
                 raf.readFully(chunk);
-                String putUrl = url + "?upload_id=" + uploadId + "&chunks=" + total + "&total=" + size
-                        + "&chunk=" + idx + "&size=" + len + "&part_number=" + (idx + 1)
+                // 参数名必须 camelCase（uploadId/partNumber），与 biliup 的 Protocol(#[serde(rename_all="camelCase")]) 一致：
+                // X-Upos-Auth 签名绑定这些 query 参数，写成 upload_id/part_number 时 CDN 首片侥幸通过、末片稳定 403 AccessDenied。
+                String putUrl = url + "?uploadId=" + uploadId + "&chunks=" + total + "&total=" + size
+                        + "&chunk=" + idx + "&size=" + len + "&partNumber=" + (idx + 1)
                         + "&start=" + off + "&end=" + (off + len);
                 putChunkWithRetry(putUrl, chunk, uposHeaders(auth, MediaType.APPLICATION_OCTET_STREAM, false), idx + 1, total);
                 parts.add(Map.of("partNumber", idx + 1, "eTag", "etag"));
@@ -224,6 +269,46 @@ public class BiliClient {
         if (dot > 0) objectName = objectName.substring(0, dot);
         log.info("bili upos 上传完成 location={} objectName={} 分片数={}", location, objectName, total);
         return new UploadOutcome(location, null, objectName);
+    }
+
+    // ---------- 2b. 封面图上传 ----------
+
+    /**
+     * 上传本地封面图（jpg/png/webp，B站限制 ≤10MB），返回 CDN 图片 URL，供 submitArchive 的 cover 字段使用。
+     * 失败抛 {@link BiliApiException}，调用方可降级为不带封面（由 B站 自行取帧）。
+     */
+    public String uploadCover(File img) {
+        if (img == null || !img.isFile() || img.length() == 0) {
+            throw new BiliApiException(-12, "封面文件不存在，无法上传");
+        }
+        if (img.length() > 10L * 1024 * 1024) {
+            throw new BiliApiException(-12, "封面图超过 B站 10MB 限制: " + img.length() + " bytes");
+        }
+        HttpHeaders part = new HttpHeaders();
+        part.setContentType(img.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".png")
+                ? MediaType.IMAGE_PNG : MediaType.IMAGE_JPEG);
+        part.setContentDispositionFormData("cover", img.getName());
+        MultiValueMap<String, Object> form = new LinkedMultiValueMap<>();
+        form.add("cover", new HttpEntity<>(new FileSystemResource(img), part));
+        form.add("csrf", jct());
+        form.add("size", String.valueOf(img.length()));
+
+        String url = COVER_UP_URL + "?ts=" + (System.currentTimeMillis() / 1000) + "&csrf=" + jct();
+        JsonNode json;
+        try {
+            ResponseEntity<String> resp = rest.exchange(java.net.URI.create(url), HttpMethod.POST,
+                    new HttpEntity<>(form, authHeaders(MediaType.MULTIPART_FORM_DATA)), String.class);
+            json = mapper.readTree(resp.getBody() == null ? "{}" : resp.getBody());
+        } catch (RestClientException | java.io.IOException e) {
+            throw new BiliApiException(-1, "封面上传请求失败(" + COVER_UP_URL + "): " + truncate(e.getMessage()));
+        }
+        int code = json.path("code").asInt(-999);
+        String coverUrl = json.path("data").path("url").asText("");
+        if (code != 0 || coverUrl.isBlank()) {
+            throw new BiliApiException(code, "封面上传被拒: " + json.path("message").asText(""));
+        }
+        log.info("bili 封面上传成功 url={} 本地={} bytes={}", coverUrl, img.getName(), img.length());
+        return coverUrl;
     }
 
     // ---------- 3. 稿件提交（member x/vu/web/add，biliup web 通道同源） ----------

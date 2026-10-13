@@ -21,6 +21,7 @@ backend/media/
 
 # ---- 日志（含 upos 上传 auth token 等）----
 *.log
+*.log.*
 logs/
 
 # ---- 桌面应用打包中间产物 ----

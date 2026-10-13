@@ -16,12 +16,23 @@ spring:
     init:
       mode: always
       schema-locations: classpath:schema.sql
+  task:
+    scheduling:
+      # 默认只有 1 条调度线程。3s 的 pipeline tick 里有阻塞式平台 HTTP，
+      # 会把 1s 的发布推进、5s 的合集调度一起拖住，tick 因此堆积成批、成批结束录制会话。
+      pool:
+        size: 4
   jackson:
     # 所有 JSON 字段输出 snake_case，与 mock-server 契约完全一致
     property-naming-strategy: SNAKE_CASE
     default-property-inclusion: always
     serialization:
       write-dates-as-timestamps: false
+  servlet:
+    # 封面素材上传：主播图片原图常见 5-15MB，Spring 默认 1MB 会直接拒掉
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 25MB
 
 mybatis-plus:
   configuration:

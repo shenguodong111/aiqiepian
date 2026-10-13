@@ -33,7 +33,12 @@ public final class DouyuApi {
 
     /**
      * GET /api/RoomApi/room/{id}
-     * @return [room_status(1=直播中), room_name]；请求/解析失败返回 null
+     *
+     * <p>注意：斗鱼「轮播」房的 {@code room_status} 同样返回 "1"（与真人直播无法区分）。
+     * 这是有意保留的——轮播内容用户也需要切片，重复内容由下游的片段内容指纹去重
+     * （见 {@code ClipFingerprint} / applyAnalysis）兜底，而不是在开播检测阶段直接排除。
+     *
+     * @return [room_status(1=直播中/轮播), room_name]；请求/解析失败返回 null
      */
     public static Object[] getRoomInfo(String roomId) {
         try {

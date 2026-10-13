@@ -1,6 +1,7 @@
 package com.aiqiepian.engine.real;
 
 import com.aiqiepian.common.BizException;
+import com.aiqiepian.common.SessionFiles;
 import com.aiqiepian.entity.LiveRoom;
 import com.aiqiepian.entity.RecordingSession;
 import com.aiqiepian.engine.Recorder;
@@ -18,6 +19,7 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -71,6 +73,8 @@ public class RealRecorder implements Recorder {
         /** 监管模式下当前正在录的分段文件（结束后登记进 segments），用于实时体积探测 */
         volatile File currentSeg;
         final List<File> segments = new ArrayList<>();
+        /** 成功录出的分段数（含首段）；断流重连次数 ≈ segmentCount-1 */
+        volatile int segmentCount;
 
         Handle(Process process, Instant startedAt, File file, LinkedList<String> logTail, boolean supervisor) {
             this.process = process;
@@ -189,6 +193,7 @@ public class RealRecorder implements Recorder {
                         synchronized (h.segments) {
                             h.segments.add(seg);
                         }
+                        h.segmentCount++;
                         consecutiveFails = 0;
                     } else {
                         // 段无数据：视为一次失败，稍后取新签名重连
@@ -245,23 +250,44 @@ public class RealRecorder implements Recorder {
         List<File> segs = new ArrayList<>(h.segments);
         h.segments.clear();
         if (segs.isEmpty()) return;
-        if (segs.size() == 1) {
-            File only = segs.get(0);
+        // 单段改名失败时把段留在句柄里，行为与旧实现一致（便于 stop 后按段统计体积）
+        if (!mergeInto(out, segs) && segs.size() == 1) h.segments.add(segs.get(0));
+    }
+
+    /** 该最终文件在录制目录下的所有分段，按 segNNN 升序 */
+    static List<File> segmentsOf(File finalFile) {
+        return SessionFiles.segmentsOf(finalFile);
+    }
+
+    /** 会话当前真正可读的文件（最终文件或回退到最新分段） */
+    public static File playableFile(String filePath) {
+        return SessionFiles.playable(filePath);
+    }
+
+    /**
+     * 把分段合并进 out：单段直接改名，多段走 concat demuxer 无损拼接，失败退到最大段。
+     * 供录制收尾与启动时的遗留分片补救共用。返回 out 是否真的可用。
+     */
+    static boolean mergeInto(File out, List<File> segs) {
+        List<File> present = new ArrayList<>();
+        for (File s : segs) if (s.isFile() && s.length() > 0) present.add(s);
+        if (present.isEmpty()) return false;
+        if (present.size() == 1) {
+            File only = present.get(0);
             if (out.isFile() && !out.delete()) out.deleteOnExit();
-            if (!only.renameTo(out)) {
-                try {
-                    Files.move(only.toPath(), out.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                } catch (Exception e) {
-                    log.warn("单段改名失败，保留原段: {}", e.toString());
-                    h.segments.add(only);
-                }
+            if (only.renameTo(out)) return out.isFile();
+            try {
+                Files.move(only.toPath(), out.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                return out.isFile();
+            } catch (Exception e) {
+                log.warn("单段改名失败: {}", e.toString());
+                return false;
             }
-            return;
         }
         try {
             File list = new File(out.getAbsolutePath() + ".list.txt");
             StringBuilder sb = new StringBuilder();
-            for (File s : segs) {
+            for (File s : present) {
                 sb.append("file '").append(s.getAbsolutePath().replace("'", "'\\''")).append("'\n");
             }
             Files.writeString(list.toPath(), sb.toString(), StandardCharsets.UTF_8);
@@ -273,25 +299,22 @@ public class RealRecorder implements Recorder {
                     "-y", out.getAbsolutePath()), 600, null);
             list.delete();
             if (code == 0 && out.isFile() && out.length() > 0) {
-                for (File s : segs) if (!s.delete()) s.deleteOnExit();
-            } else {
-                log.warn("合并分段失败(code={})，回退最大段", code);
-                fallbackLargest(out, segs);
+                for (File s : present) if (!s.delete()) s.deleteOnExit();
+                return true;
             }
+            log.warn("合并分段失败(code={})，回退最大段", code);
         } catch (Exception e) {
-            log.warn("合并分段异常，回退最大段: {}", e.toString());
-            fallbackLargest(out, segs);
+            log.warn("合并分段异常: {}", e.toString());
         }
-    }
-
-    private void fallbackLargest(File out, List<File> segs) {
         File best = null;
-        for (File s : segs) if (best == null || s.length() > best.length()) best = s;
-        if (best == null) return;
+        for (File s : present) if (best == null || s.length() > best.length()) best = s;
+        if (best == null) return false;
         try {
-            Files.move(best.toPath(), out.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            Files.move(best.toPath(), out.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            return out.isFile();
         } catch (Exception e) {
             log.warn("兜底改名最大段失败: {}", e.toString());
+            return false;
         }
     }
 
@@ -330,11 +353,22 @@ public class RealRecorder implements Recorder {
             bytes = f != null && f.isFile() ? f.length() : 0L;
         }
         if (actualSec >= 0) {
-            session.setRecordedSec(Math.max(0, actualSec));
             int limit = session.getDurationSec() == null ? 0 : session.getDurationSec();
             if (limit <= 0 || actualSec <= limit) {
                 session.setDurationSec(Math.max(0, actualSec));
             }
+        }
+        // recorded_sec 用最终文件的真实时长，避免斗鱼/虎牙断流导致「墙钟时长」虚高。
+        File finalFile = session.getFilePath() == null ? null : new File(session.getFilePath());
+        double captured = finalFile != null && finalFile.isFile() ? FfmpegSupport.probeDuration(finalFile) : -1;
+        int wallSec = Math.max(0, actualSec);
+        session.setRecordedSec(captured > 1 ? (int) Math.round(captured) : wallSec);
+        // 断流重连次数：监管模式下 = 成功分段数-1（每断一次重连就多一段）；B站单进程恒 0
+        int reconnects = (h != null && h.supervisor) ? Math.max(0, h.segmentCount - 1) : 0;
+        session.setReconnectCount(reconnects);
+        if (reconnects > 0) {
+            log.info("录制收尾 session={} 墙钟={}s 实际捕获={}s 断流重连={}次",
+                    session.getId(), wallSec, (int) captured, reconnects);
         }
         session.setFileSizeBytes(bytes);
     }
@@ -408,6 +442,12 @@ public class RealRecorder implements Recorder {
             return url == null ? null : new Source(url, UA, "https://www.huya.com/" + roomId);
         }
         return null;
+    }
+
+    /** 一键停止显式收尾：与 @PreDestroy 同一套逻辑，句柄已清空则什么都不做 */
+    @Override
+    public void drainForShutdown() {
+        if (!handles.isEmpty()) shutdownAll();
     }
 
     /** JVM 关闭时收尾所有录制：置 stopping、杀 ffmpeg、短暂等待监管线程合并分段，避免遗留孤儿进程与未合并分段 */

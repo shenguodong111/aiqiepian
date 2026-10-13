@@ -69,7 +69,7 @@ public class MediaController {
     }
 
     /**
-     * 流式播放/预览：type=session|work|clip|cover，id=对应记录主键。
+     * 流式播放/预览：type=session|work|clip|cover|asset，id=对应记录主键。
      * 路径全部由服务端从 DB 解析（前端无法传任意路径），支持 HTTP Range 以便 <video> 拖动。
      */
     @GetMapping("/stream")

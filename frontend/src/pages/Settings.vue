@@ -51,6 +51,7 @@ const form = reactive({
   ai_cloud_key: '',
   asr_enabled: true,
   reel_enabled: true,
+  clip_dedup_enabled: true,
   asr_model: 'small',
   asr_language: 'zh',
   asr_python: '',
@@ -229,6 +230,16 @@ onMounted(load)
             <span>每次录制分析完成后，自动精选片段拼接成一支高光成片（真实引擎生效）</span>
           </label>
           <p class="hint">成片时长随录制总时长自适应（约录制时长的 1/3，最短 5 分钟、最长 20 分钟）。无弹幕或弹幕稀薄的直播间会优先用语音/画面信号选段。产物出现在剪辑工作台。</p>
+        </div>
+
+        <!-- 轮播/重复内容去重 -->
+        <div class="card group">
+          <div class="group-title">轮播内容去重 <span class="badge cyan" style="margin-left: 8px">{{ form.clip_dedup_enabled ? '已开启' : '已关闭' }}</span></div>
+          <label class="check-line top-line">
+            <label class="switch"><input type="checkbox" v-model="form.clip_dedup_enabled" /><span class="track"></span></label>
+            <span>对每个候选片段算画面指纹，与同房间历史片段比对，重复内容不再成片（真实引擎生效）</span>
+          </label>
+          <p class="hint">斗鱼等平台的「轮播」房会不停重播同一段录播内容。开启后照常录制，但循环重播的<b>同一片段只会被剪一次</b>，不会重复出片；轮播里不同的内容仍会正常切片。关闭则每次循环都会重新出片。</p>
         </div>
 
         <!-- 存储 -->

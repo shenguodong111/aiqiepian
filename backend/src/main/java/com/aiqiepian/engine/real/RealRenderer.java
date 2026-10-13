@@ -1,13 +1,16 @@
 package com.aiqiepian.engine.real;
 
 import com.aiqiepian.entity.Clip;
+import com.aiqiepian.entity.CoverAsset;
 import com.aiqiepian.entity.RecordingSession;
 import com.aiqiepian.entity.Work;
 import com.aiqiepian.engine.Renderer;
 import com.aiqiepian.engine.model.RenderResult;
 import com.aiqiepian.mapper.ClipMapper;
+import com.aiqiepian.mapper.CoverAssetMapper;
 import com.aiqiepian.mapper.RecordingSessionMapper;
 import com.aiqiepian.service.SettingsService;
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,7 +25,8 @@ import java.util.List;
 
 /**
  * 真实成片（M1）：对录制的 mp4 用 ffmpeg 剪切 clip（-ss/-t），叠加标题条
- * （drawtext + C:/Windows/Fonts/msyh.ttc），并生成封面（中间点抽帧）。
+ * （drawtext + C:/Windows/Fonts/msyh.ttc），并生成封面。
+ * 封面优先用房间配置的主播图片素材（CoverComposer 叠标题文字），未配置素材则截源视频帧再加字。
  * 降级链：drawtext 重编码失败 → 纯 -c copy 剪切 → 直接复制源文件，保证成片必出。
  * 输出 media/works/work_{id}.mp4。
  */
@@ -38,7 +42,9 @@ public class RealRenderer implements Renderer {
     private final SettingsService settings;
     private final ClipMapper clipMapper;
     private final RecordingSessionMapper sessionMapper;
+    private final CoverAssetMapper coverAssetMapper;
     private final AsrClient asr;
+    private final CoverComposer coverComposer;
 
     @Override
     public RenderResult render(Work work) {
@@ -54,10 +60,16 @@ public class RealRenderer implements Renderer {
         // 高光集锦：作品自带多区间裁切清单则走 concat 拼接渲染，不落到单切片分支
         if (work.getReelSegments() != null && !work.getReelSegments().isBlank()) {
             File reelSource = existing(work.getSourcePath());
-            Path cover = Path.of(dir, "covers", "work_" + work.getId() + "_cover.jpg");
-            boolean reelOk = reelSource != null
-                    && renderReel(reelSource, work.getReelSegments(), out, cover, work.getTitle());
-            if (!reelOk) log.warn("高光集锦成片失败，work={} 保持占位输出", work.getId());
+            boolean reelOk = reelSource != null && renderReel(reelSource, work.getReelSegments(), out, work.getTitle());
+            if (reelOk) {
+                // 封面取第一段高亮的中间点：从未烧字的原始录制取帧，文字统一交给 CoverComposer 叠
+                List<int[]> segs = parseSegments(work.getReelSegments());
+                int[] first = segs.isEmpty() ? new int[]{0, 6} : segs.get(0);
+                makeCover(out.toFile(), reelSource, work, dir, first[0], first[1] - first[0],
+                        FfmpegSupport.probeDuration(reelSource));
+            } else {
+                log.warn("高光集锦成片失败，work={} 保持占位输出", work.getId());
+            }
             return new RenderResult(out.toString());
         }
 
@@ -109,6 +121,35 @@ public class RealRenderer implements Renderer {
 
         makeCover(out.toFile(), source, work, dir, start, dur, len);
         return new RenderResult(out.toString());
+    }
+
+    /** 只重建封面（改了标题/换了底图）：重新定位源与区间后走同一套封面优先级 */
+    @Override
+    public void buildCover(Work work) {
+        if (work == null || work.getId() == null) return;
+        String dir = settings.getStr("media_dir", "./media");
+        File source;
+        double start = 0;
+        double dur = 6;
+        if (work.getReelSegments() != null && !work.getReelSegments().isBlank()) {
+            source = existing(work.getSourcePath());
+            List<int[]> segs = parseSegments(work.getReelSegments());
+            if (!segs.isEmpty()) {
+                start = segs.get(0)[0];
+                dur = segs.get(0)[1] - segs.get(0)[0];
+            }
+        } else {
+            source = resolveSource(work);
+            Clip clip = work.getClipId() == null ? null : clipMapper.selectById(work.getClipId());
+            if (clip != null && clip.getStartSec() != null && clip.getEndSec() != null
+                    && clip.getEndSec() > clip.getStartSec()) {
+                start = clip.getStartSec();
+                dur = clip.getEndSec() - clip.getStartSec();
+            }
+        }
+        File workFile = existing(work.getOutputPath());
+        double srcLen = source == null ? -1 : FfmpegSupport.probeDuration(source);
+        makeCover(workFile, source, work, dir, start, dur, srcLen);
     }
 
     /** clip 文件（若分析真实产出过）优先，否则回到会话原始录制文件 */
@@ -201,7 +242,10 @@ public class RealRenderer implements Renderer {
         }
     }
 
-    /** 封面：成片中间点抽帧；失败退回源文件抽帧 */
+    /**
+     * 封面优先级：本作品手工指定底图 &gt; 房间图片素材（按作品 id 轮播）&gt; 源视频截帧。
+     * 三种来源都统一由 {@link CoverComposer} 叠标题文字；全失败才退回成片裸抽帧。
+     */
     private void makeCover(File workFile, File source, Work work, String dir,
                            double start, double dur, double srcLen) {
         Path cover;
@@ -216,11 +260,53 @@ public class RealRenderer implements Renderer {
             log.warn("创建 covers 目录失败: {}", e.toString());
             return;
         }
-        double mid = dur / 2;
-        if (!ffmpegCover(workFile, cover, mid) && srcLen > 0) {
-            double absMid = Math.min(Math.max(start + mid, 0), Math.max(0, srcLen - 0.5));
-            ffmpegCover(source, cover, absMid);
+        String title = coverTitle(work);
+        File bg = coverBackground(work);
+        if (bg != null) {
+            if (coverComposer.fromImage(bg, title, cover)) {
+                log.info("封面已用图片素材合成 work={} bg={}", work.getId(), bg.getName());
+                return;
+            }
+            log.warn("图片素材封面失败，退回截帧 work={} bg={}", work.getId(), bg);
         }
+        double mid = dur / 2;
+        if (source != null
+                && coverComposer.fromFrame(source, clampMid(start, mid, srcLen), title, cover)) {
+            return;
+        }
+        if (workFile == null || !ffmpegCover(workFile, cover, mid)) {
+            log.warn("封面生成全部失败，work={}", work.getId());
+        }
+    }
+
+    /** 源文件内的取帧点：段中点，按真实文件长度钳制 */
+    private static double clampMid(double start, double mid, double srcLen) {
+        double abs = start + mid;
+        return srcLen > 0 ? Math.min(Math.max(abs, 0), Math.max(0, srcLen - 0.5)) : Math.max(0, abs);
+    }
+
+    private static String coverTitle(Work work) {
+        if (work.getTitle() != null && !work.getTitle().isBlank()) return work.getTitle();
+        return work.getRoomName() == null || work.getRoomName().isBlank() ? "精彩片段" : work.getRoomName();
+    }
+
+    /**
+     * 封面底图：作品手工指定优先，否则取该房间的图片素材，按作品 id 轮播
+     * （同一主播连发多条时封面不重样）。素材文件被移走则顺延下一张。
+     */
+    private File coverBackground(Work work) {
+        File manual = existing(work.getCoverImage());
+        if (manual != null) return manual;
+        if (work.getRoomId() == null || work.getId() == null) return null;
+        List<CoverAsset> assets = coverAssetMapper.selectList(Wrappers.<CoverAsset>lambdaQuery()
+                .eq(CoverAsset::getRoomId, work.getRoomId()).orderByAsc(CoverAsset::getId));
+        if (assets.isEmpty()) return null;
+        int n = assets.size();
+        for (int i = 0; i < n; i++) {
+            File f = existing(assets.get((int) Math.floorMod(work.getId() + i, n)).getFilePath());
+            if (f != null) return f;
+        }
+        return null;
     }
 
     private boolean ffmpegCover(File in, Path cover, double ss) {
@@ -237,10 +323,11 @@ public class RealRenderer implements Renderer {
 
     /**
      * 高光集锦：从同一原片按多个 [start,end]（秒）区间裁切，用 filter_complex trim+concat
-     * 一次拼接成一支成片，并叠加标题条。单次编码，避免逐段产物再合并；成功后从集锦中段抽封面。
+     * 一次拼接成一支成片，并叠加标题条。单次编码，避免逐段产物再合并。
+     * 封面由调用方在成功后另行生成（要从未烧字的源片取帧）。
      * segments 格式 "start,end;start,end"。任何失败返回 false（调用方保持占位输出）。
      */
-    private boolean renderReel(File source, String segments, Path out, Path cover, String title) {
+    private boolean renderReel(File source, String segments, Path out, String title) {
         if (source == null || segments == null || segments.isBlank()) return false;
         List<int[]> segs = parseSegments(segments);
         if (segs.isEmpty()) return false;
@@ -251,7 +338,109 @@ public class RealRenderer implements Renderer {
             return false;
         }
         double srcLen = FfmpegSupport.probeDuration(source);
+        if (renderReelSeekCut(source, segs, srcLen, out, title)) return true;
+        return renderReelFilterComplex(source, segs, srcLen, out, title);
+    }
 
+    /**
+     * 快速路径：逐段把 `-ss` 放在 `-i` 前面（输入端定位，只解码这一段），加标题条后编成参数完全一致的
+     * 临时片，再用 concat demuxer 无损拼接。
+     *
+     * <p>老路径的 trim 滤镜是在解码之后才裁切，所以哪怕只取一小时录制里的十分钟高光，ffmpeg 也要从
+     * 第 0 秒解到最后一段的结尾。任一段失败、拼接产物异常或时长对不上，都返回 false 回退老路径。
+     */
+    private boolean renderReelSeekCut(File source, List<int[]> segs, double srcLen, Path out, String title) {
+        String base = out.getFileName().toString().replaceAll("\\.[^.]+$", "");
+        Path tmpDir = out.getParent().resolve("reel_tmp");
+        List<Path> temps = new ArrayList<>();
+        Path listFile = tmpDir.resolve(base + "_list.txt");
+        double expected = 0;
+        try {
+            Files.createDirectories(tmpDir);
+            String draw = drawTextFilter(title);
+            int idx = 0;
+            for (int[] seg : segs) {
+                double s = Math.max(0, seg[0]);
+                double e = seg[1];
+                if (srcLen > 0) e = Math.min(e, srcLen);
+                double d = e - s;
+                if (d < 1) continue;
+                Path segFile = tmpDir.resolve(base + "_seg" + idx + ".mp4");
+                List<String> cmd = new ArrayList<>(List.of(
+                        "ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "-ss", fmt(s), "-i", source.getAbsolutePath(), "-t", fmt(d)));
+                if (!draw.isEmpty()) cmd.addAll(List.of("-vf", draw));
+                cmd.addAll(List.of(
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+                        "-y", segFile.toString()));
+                StringBuilder err = new StringBuilder();
+                if (FfmpegSupport.run(cmd, Math.max(120, (long) (d * 4)), err) != 0 || !outIsGood(segFile)) {
+                    log.warn("集锦快速切段失败 seg[{}-{}]：{}", s, e, err);
+                    return false;
+                }
+                double got = FfmpegSupport.probeDuration(segFile.toFile());
+                if (got <= 0.5 || Math.abs(got - d) > Math.max(2, d * 0.2)) {
+                    log.warn("集锦快速切段时长异常 seg[{}-{}] 实得={}s", s, e, String.format("%.1f", got));
+                    return false;
+                }
+                temps.add(segFile);
+                expected += d;
+                idx++;
+            }
+            if (temps.isEmpty()) return false;
+
+            StringBuilder list = new StringBuilder();
+            for (Path p : temps) {
+                list.append("file '").append(p.toAbsolutePath().toString().replace("'", "'\\''")).append("'\n");
+            }
+            Files.writeString(listFile, list.toString());
+            List<String> cmd = List.of(
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-f", "concat", "-safe", "0", "-i", listFile.toString(),
+                    "-c", "copy", "-movflags", "+faststart",
+                    "-y", out.toString());
+            StringBuilder err = new StringBuilder();
+            if (FfmpegSupport.run(cmd, Math.max(180, (long) (expected * 2)), err) != 0 || !outIsGood(out)) {
+                log.warn("集锦无损拼接失败: {}", err);
+                return false;
+            }
+            double real = FfmpegSupport.probeDuration(out.toFile());
+            if (real <= 0.5 || Math.abs(real - expected) > Math.max(3, expected * 0.1)) {
+                log.warn("集锦无损拼接时长异常 期望≈{}s 实得={}s，回退整段裁切", (long) expected,
+                        String.format("%.1f", real));
+                return false;
+            }
+            log.info("高光集锦已产出(快速切段): {} 段={} 时长≈{}s", out, temps.size(), (long) real);
+            return true;
+        } catch (Exception e) {
+            log.warn("高光集锦快速切段异常，回退整段裁切: {}", e.toString());
+            return false;
+        } finally {
+            for (Path p : temps) deleteQuietly(p);
+            deleteQuietly(listFile);
+        }
+    }
+
+    /** 标题条滤镜（不含前置输入标签）：title 为空则返回空串，表示不加字 */
+    private static String drawTextFilter(String title) {
+        if (title == null || title.isBlank()) return "";
+        return "drawtext=fontfile=" + FONT_FILE
+                + ":text='" + FfmpegSupport.escapeFilterValue(title) + "'"
+                + ":fontsize=42:fontcolor=white:borderw=3:bordercolor=black"
+                + ":box=1:boxcolor=black@0.45:boxborderw=18"
+                + ":x=(w-text_w)/2:y=h*0.08";
+    }
+
+    private static void deleteQuietly(Path p) {
+        try {
+            Files.deleteIfExists(p);
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** 老路径：filter_complex trim+concat 单次拼接（要解码到最后一段的结尾，长录制明显更慢） */
+    private boolean renderReelFilterComplex(File source, List<int[]> segs, double srcLen, Path out, String title) {
         StringBuilder fc = new StringBuilder();
         StringBuilder concatIn = new StringBuilder();
         int n = 0;
@@ -294,13 +483,6 @@ public class RealRenderer implements Renderer {
         if (!ok) {
             log.warn("高光集锦渲染失败(exit={}) segs={} out={}: {}", code, n, out, err);
             return false;
-        }
-        // 封面：从集锦本身中段抽帧（集锦已重编码，直接抽最稳）
-        try {
-            if (cover.getParent() != null) Files.createDirectories(cover.getParent());
-            ffmpegCover(out.toFile(), cover, totalDur / 2);
-        } catch (Exception e) {
-            log.warn("集锦封面抽帧异常（忽略）: {}", e.toString());
         }
         log.info("高光集锦已产出: {} 段={} 时长≈{}s", out, n, (long) totalDur);
         return true;

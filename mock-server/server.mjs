@@ -28,6 +28,7 @@ const db = {
     auto_reject_score: 70,
     auto_work_min_score: 70,
     reel_enabled: true,
+    clip_dedup_enabled: true,
     sensitive_words: '',
     manual_on_uncertain: true,
     auto_publish: true,
@@ -344,6 +345,7 @@ const server = http.createServer(async (req, res) => {
     if (!body.platform || !body.room_url) return err(res, '参数不完整：platform/room_url 必填')
     const room = { id: nid(), platform: body.platform, room_url: body.room_url, room_name: body.room_name || '', anchor_name: body.anchor_name || '',
       monitor_enabled: body.monitor_enabled ?? true, auto_record: body.auto_record ?? true, auto_publish: body.auto_publish ?? true, analyze_template: body.analyze_template || 'highlight',
+      publish_tags: body.publish_tags || '',
       status: (body.monitor_enabled ?? true) ? 'MONITORING' : 'OFF', last_live_at: null, created_at: now(), updated_at: now() }
     db.rooms.push(room); return ok(res, room)
   }
@@ -606,6 +608,7 @@ const server = http.createServer(async (req, res) => {
     platform: r.platform, room_url: r.room_url, room_name: r.room_name || '', anchor_name: r.anchor_name || '',
     live_title: r.live_title || '', monitor_enabled: r.monitor_enabled ?? true, auto_record: r.auto_record ?? true,
     auto_publish: r.auto_publish ?? true, analyze_template: r.analyze_template || 'highlight',
+    publish_tags: r.publish_tags || '',
   })
   const urlOf = roomId => db.rooms.find(r => r.id === roomId)?.room_url || ''
   const toCfgRow = (row, extra) => {

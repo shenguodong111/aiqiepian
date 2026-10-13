@@ -2,6 +2,7 @@ package com.aiqiepian.service;
 
 import com.aiqiepian.common.PageResult;
 import com.aiqiepian.entity.Work;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 import java.util.Map;
@@ -24,8 +25,20 @@ public interface WorkService {
     /** 手动发布：需已绑定账号且状态 READY/APPROVED */
     Work publish(long id);
 
+    /** 审片通过：PENDING_REVIEW → APPROVED，若 auto_publish 开启则自动入队发布 */
+    Work approve(long id);
+
     /** 智能标题建议：{title, kind, summary}，不落库（FR-P5-05） */
     Map<String, Object> suggestTitle(long id);
+
+    /** 为单个作品指定封面底图（优先于房间素材），保存后立即重合成 图片+标题 封面 */
+    Work setCoverImage(long id, MultipartFile file);
+
+    /** 清除作品的手工封面底图，回到「房间素材 &gt; 成片截帧」自动策略并重合成 */
+    Work clearCoverImage(long id);
+
+    /** 只重合成封面（改了标题后让封面文字跟上），不重编视频 */
+    Work rebuildCover(long id);
 
     /**
      * 删除作品：连带成片/封面/字幕文件与审核、发布记录。

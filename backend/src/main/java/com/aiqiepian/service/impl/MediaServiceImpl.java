@@ -1,12 +1,15 @@
 package com.aiqiepian.service.impl;
 
 import com.aiqiepian.common.PageResult;
+import com.aiqiepian.common.SessionFiles;
 import com.aiqiepian.entity.Clip;
+import com.aiqiepian.entity.CoverAsset;
 import com.aiqiepian.entity.PublishTask;
 import com.aiqiepian.entity.RecordingSession;
 import com.aiqiepian.entity.ReviewRecord;
 import com.aiqiepian.entity.Work;
 import com.aiqiepian.mapper.ClipMapper;
+import com.aiqiepian.mapper.CoverAssetMapper;
 import com.aiqiepian.mapper.PublishTaskMapper;
 import com.aiqiepian.mapper.RecordingSessionMapper;
 import com.aiqiepian.mapper.ReviewRecordMapper;
@@ -35,6 +38,7 @@ public class MediaServiceImpl implements MediaService {
     private final RecordingSessionMapper sessionMapper;
     private final WorkMapper workMapper;
     private final ClipMapper clipMapper;
+    private final CoverAssetMapper coverAssetMapper;
     private final ReviewRecordMapper reviewRecordMapper;
     private final PublishTaskMapper publishTaskMapper;
     private final SettingsService settings;
@@ -213,7 +217,8 @@ public class MediaServiceImpl implements MediaService {
         switch (type) {
             case "session" -> {
                 RecordingSession s = sessionMapper.selectById(id);
-                return s == null ? null : existing(s.getFilePath());
+                // 录制中的会话最终文件还没生成（只有 .segNNN.mp4），回退到最新分段才能边录边看
+                return s == null ? null : SessionFiles.playable(s.getFilePath());
             }
             case "work" -> {
                 Work w = workMapper.selectById(id);
@@ -222,6 +227,10 @@ public class MediaServiceImpl implements MediaService {
             case "cover" -> {
                 Work w = workMapper.selectById(id);
                 return w == null ? null : existing(w.getCoverPath());
+            }
+            case "asset" -> {
+                CoverAsset a = coverAssetMapper.selectById(id);
+                return a == null ? null : existing(a.getFilePath());
             }
             case "clip" -> {
                 Clip c = clipMapper.selectById(id);
@@ -327,12 +336,18 @@ public class MediaServiceImpl implements MediaService {
         if (purgeOrphans) {
             Set<String> ref = new HashSet<>();
             for (RecordingSession s : sessionMapper.selectList(null)) addRef(ref, s.getFilePath());
-            for (Work w : workMapper.selectList(null)) { addRef(ref, w.getOutputPath()); addRef(ref, w.getCoverPath()); }
+            for (Work w : workMapper.selectList(null)) {
+                addRef(ref, w.getOutputPath());
+                addRef(ref, w.getCoverPath());
+                addRef(ref, w.getCoverImage());
+            }
             String dir = settings.getStr("media_dir", "./media");
             for (String sub : new String[]{"recordings", "works", "covers", "clips", "subtitles"}) {
                 File[] fs = new File(dir, sub).listFiles();
                 if (fs == null) continue;
                 for (File f : fs) {
+                    // covers/assets、covers/manual 是封面素材子目录，由 cover_asset 表自己管生命周期
+                    if (!f.isFile()) continue;
                     if (ref.contains(canonical(f.getAbsolutePath()))) continue;
                     long len = f.length();
                     if (!deleteFiles) { orphans++; continue; }

@@ -77,6 +77,7 @@ export const WORK_STATUS = {
   DRAFT: { label: '草稿', cls: 'gray' },
   RENDERING: { label: '渲染中', cls: 'cyan' },
   READY: { label: '待送审', cls: 'blue' },
+  PENDING_REVIEW: { label: '待审片', cls: 'orange' },
   APPROVED: { label: '已通过', cls: 'green' },
   REJECTED: { label: '已拒绝', cls: 'red' },
   PUBLISHING: { label: '发布中', cls: 'cyan' },

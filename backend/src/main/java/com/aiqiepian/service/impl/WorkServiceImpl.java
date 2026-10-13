@@ -3,6 +3,7 @@ package com.aiqiepian.service.impl;
 import com.aiqiepian.common.BizException;
 import com.aiqiepian.common.BodyUtils;
 import com.aiqiepian.common.PageResult;
+import com.aiqiepian.engine.Renderer;
 import com.aiqiepian.engine.model.PublishAccount;
 import com.aiqiepian.entity.Clip;
 import com.aiqiepian.entity.PublishTask;
@@ -12,6 +13,7 @@ import com.aiqiepian.mapper.ClipMapper;
 import com.aiqiepian.mapper.PublishTaskMapper;
 import com.aiqiepian.mapper.ReviewRecordMapper;
 import com.aiqiepian.mapper.WorkMapper;
+import com.aiqiepian.service.CoverAssetService;
 import com.aiqiepian.service.PipelineService;
 import com.aiqiepian.service.PublishService;
 import com.aiqiepian.service.SettingsService;
@@ -20,6 +22,7 @@ import com.aiqiepian.service.WorkService;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.io.File;
 import java.time.LocalDateTime;
@@ -39,6 +42,8 @@ public class WorkServiceImpl implements WorkService {
     private final PipelineService pipeline;
     private final PublishService publishService;
     private final TitleGenerator titleGenerator;
+    private final Renderer renderer;
+    private final CoverAssetService coverAssetService;
 
     @Override
     public PageResult<Work> list(String status, Integer page, Integer size) {
@@ -63,7 +68,12 @@ public class WorkServiceImpl implements WorkService {
     public Work update(long id, Map<String, Object> body) {
         Work w = workMapper.selectById(id);
         if (w == null) throw new BizException(404, "不存在");
-        if (body.containsKey("title")) w.setTitle(BodyUtils.str(body, "title", w.getTitle()));
+        boolean titleChanged = false;
+        if (body.containsKey("title")) {
+            String t = BodyUtils.str(body, "title", w.getTitle());
+            titleChanged = t != null && !t.equals(w.getTitle());
+            w.setTitle(t);
+        }
         if (body.containsKey("description")) w.setDescription(BodyUtils.str(body, "description", w.getDescription()));
         if (body.containsKey("tags")) w.setTags(BodyUtils.str(body, "tags", w.getTags()));
         if (body.containsKey("cover_path")) w.setCoverPath(BodyUtils.str(body, "cover_path", w.getCoverPath()));
@@ -72,6 +82,8 @@ public class WorkServiceImpl implements WorkService {
         if (body.containsKey("aspect_ratio")) w.setAspectRatio(BodyUtils.str(body, "aspect_ratio", w.getAspectRatio()));
         w.setUpdatedAt(LocalDateTime.now());
         workMapper.updateById(w);
+        // 封面文字取自标题：审片时改了名要立刻跟上，否则发出去标题和封面各说一套
+        if (titleChanged) renderer.buildCover(w);
         return w;
     }
 
@@ -101,11 +113,28 @@ public class WorkServiceImpl implements WorkService {
         if (w == null) throw new BizException(404, "不存在");
         PublishAccount account = publishService.getAccount();
         if (account == null) throw new BizException("请先绑定发布账号");
-        if (!"READY".equals(w.getStatus()) && !"APPROVED".equals(w.getStatus())) {
+        if (!"READY".equals(w.getStatus()) && !"APPROVED".equals(w.getStatus()) && !"PENDING_REVIEW".equals(w.getStatus())) {
             throw new BizException("当前状态不可发布");
         }
         // 人工点「发布」：不受全局/房间自动发布开关限制（respectRoomAutoPublish=false）
         pipeline.queuePublish(w, false);
+        return w;
+    }
+
+    @Override
+    public Work approve(long id) {
+        Work w = workMapper.selectById(id);
+        if (w == null) throw new BizException(404, "不存在");
+        if (!"PENDING_REVIEW".equals(w.getStatus()) && !"READY".equals(w.getStatus())) {
+            throw new BizException("仅待审/待送审状态可审批通过");
+        }
+        w.setStatus("APPROVED");
+        w.setUpdatedAt(java.time.LocalDateTime.now());
+        workMapper.updateById(w);
+        // 审批通过后，若全局自动发布开启且房间也开启，自动入队发布
+        if (pipeline.autoPublishAllowed(w)) {
+            pipeline.queuePublish(w);
+        }
         return w;
     }
 
@@ -117,6 +146,44 @@ public class WorkServiceImpl implements WorkService {
         if (c == null) throw new BizException("作品无关联片段，无法生成标题");
         TitleGenerator.Result r = titleGenerator.suggest(c);
         return Map.of("title", r.title(), "kind", r.kind(), "summary", r.summary());
+    }
+
+    @Override
+    public Work setCoverImage(long id, MultipartFile file) {
+        Work w = workMapper.selectById(id);
+        if (w == null) throw new BizException(404, "不存在");
+        String path = coverAssetService.saveImage(file, "covers/manual", "work_" + id);
+        deleteIfPresent(w.getCoverImage());
+        w.setCoverImage(path);
+        w.setUpdatedAt(LocalDateTime.now());
+        workMapper.updateById(w);
+        renderer.buildCover(w);
+        return w;
+    }
+
+    @Override
+    public Work clearCoverImage(long id) {
+        Work w = workMapper.selectById(id);
+        if (w == null) throw new BizException(404, "不存在");
+        deleteIfPresent(w.getCoverImage());
+        LocalDateTime now = LocalDateTime.now();
+        // updateById 会跳过 null 字段，清空底图必须走显式 SET
+        workMapper.update(null, Wrappers.<Work>lambdaUpdate()
+                .set(Work::getCoverImage, null)
+                .set(Work::getUpdatedAt, now)
+                .eq(Work::getId, id));
+        w.setCoverImage(null);
+        w.setUpdatedAt(now);
+        renderer.buildCover(w);
+        return w;
+    }
+
+    @Override
+    public Work rebuildCover(long id) {
+        Work w = workMapper.selectById(id);
+        if (w == null) throw new BizException(404, "不存在");
+        renderer.buildCover(w);
+        return w;
     }
 
     @Override
@@ -153,7 +220,7 @@ public class WorkServiceImpl implements WorkService {
 
     /**
      * 删除单个作品的文件与关联记录。已发布且未 force → 返回 -1（跳过，不删）。
-     * 删除范围：成片 output、封面 cover、字幕 subtitles/work_{id}.srt + 审核记录 + 发布任务 + 作品行。
+     * 删除范围：成片 output、封面 cover、手工封面底图、字幕 subtitles/work_{id}.srt + 审核记录 + 发布任务 + 作品行。
      */
     long deleteWorkInternal(Work w, boolean force, boolean deleteFiles) {
         if ("PUBLISHED".equals(w.getStatus()) && !force) return -1;
@@ -161,6 +228,7 @@ public class WorkServiceImpl implements WorkService {
         if (deleteFiles) {
             freed += deleteIfPresent(w.getOutputPath());
             freed += deleteIfPresent(w.getCoverPath());
+            freed += deleteIfPresent(w.getCoverImage());
             String dir = settings.getStr("media_dir", "./media");
             freed += deleteIfPresent(dir + "/subtitles/work_" + w.getId() + ".srt");
         }

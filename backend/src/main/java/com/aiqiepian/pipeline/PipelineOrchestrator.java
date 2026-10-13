@@ -37,8 +37,11 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 管线编排器：每 3s tick，逻辑逐步对照 mock-server server.mjs 的 tick()。
@@ -50,6 +53,8 @@ public class PipelineOrchestrator {
 
     private static final Logger log = LoggerFactory.getLogger(PipelineOrchestrator.class);
     private static final int TICK_SEC = 3;
+    /** 刚起录的这段时间内即便平台报"未开播"也不结束会话：开播瞬间状态位常有延迟/抖动 */
+    private static final int START_GRACE_SEC = 120;
     private static final List<String> BLOCKED_WHEN_OFF = List.of("ANALYZE", "RENDER", "REVIEW", "PUBLISH");
 
     private final LiveRoomMapper roomMapper;
@@ -65,12 +70,30 @@ public class PipelineOrchestrator {
     private final Reviewer reviewer;
     private final Publisher publisher;
 
+    /**
+     * 每个房间上次"下播探测"的时间戳（毫秒）。录制中的房间不必每 3s 打一次平台接口——
+     * 频繁轮询会触发平台限流，而限流失败过去被当成下播，反过来把健康的录制打断重建。
+     */
+    private final Map<Long, Long> lastLiveCheckAt = new ConcurrentHashMap<>();
+
+    /** real 模式下已提交给重活线程池、尚未跑完的 job 数量（按类型）：用于兑现并发上限设置 */
+    private final Map<String, Integer> inFlight = new ConcurrentHashMap<>();
+
     /** mock | real：real 模式下录制/监控走真实引擎（ffmpeg + B站 API），mock 行为保持原样 */
     @Value("${engine.mode:mock}")
     private String engineMode;
 
     private boolean realMode() {
         return "real".equalsIgnoreCase(engineMode);
+    }
+
+    /**
+     * 下播探测间隔：跟随设置页"监控轮询间隔（秒）"。此前该设置根本没被读取，
+     * 录制中的房间被按 3s 一次死磕平台接口，是限流→误判下播→会话反复重建的直接来源。
+     * 下限 15s：真下播最多晚 15s 收尾，换来录制不再被抖动打断。
+     */
+    private long downCheckIntervalMs() {
+        return Math.max(15, settings.getInt("monitor_interval_sec", 60)) * 1000L;
     }
 
     /**
@@ -92,19 +115,41 @@ public class PipelineOrchestrator {
 
     @PreDestroy
     void shutdownExecutor() {
-        if (heavyExecutor != null) heavyExecutor.shutdownNow();
+        if (heavyExecutor == null) return;
+        // 先 shutdown（不中断正在跑的线程）给"片段入库"这类短关键段一个收尾窗口，
+        // 超过 45s 还在跑的重活（Whisper/编码）才强制掐掉——被掐的那次会由启动补排重跑。
+        heavyExecutor.shutdown();
+        try {
+            if (!heavyExecutor.awaitTermination(45, TimeUnit.SECONDS)) {
+                heavyExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            heavyExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     /** 把 job 成功后的真实工作移出调度线程执行；异常仅记录（job 已置 SUCCESS，与旧同步行为一致，不重复触发） */
     private void submitHeavy(PipelineJob j, LocalDateTime now) {
+        if (realMode()) inFlight.compute(j.getJobType(), (k, v) -> v == null ? 1 : v + 1);
         heavyExecutor.submit(() -> {
             try {
                 onJobSuccess(j, now);
             } catch (Exception e) {
                 log.error("后台执行真实工作异常 type={} entityId={}: {}",
                         j.getJobType(), j.getEntityId(), e.toString(), e);
+            } finally {
+                if (realMode()) inFlight.compute(j.getJobType(), (k, v) -> v == null || v <= 1 ? null : v - 1);
             }
         });
+    }
+
+    /**
+     * 真实引擎下 job 在表里只停留一个 tick 就变 SUCCESS，正在跑的重活不再体现于 RUNNING 行，
+     * 因此并发上限改看已提交但未完成的重活数量。
+     */
+    private int inFlightCount(String jobType) {
+        return inFlight.getOrDefault(jobType, 0);
     }
 
     @Scheduled(fixedRate = 3000)
@@ -119,9 +164,10 @@ public class PipelineOrchestrator {
     private void doTick() {
         final boolean autoRun = settings.getBool("auto_run", true);
         final int maxRetry = settings.getInt("max_retry", 3);
-        final int capAnalyze = settings.getInt("max_concurrent_analyze", 2);
-        final int capRender = settings.getInt("max_concurrent_render", 2);
+        final int limitAnalyze = settings.getInt("max_concurrent_analyze", 2);
+        final int limitRender = settings.getInt("max_concurrent_render", 2);
         final LocalDateTime now = LocalDateTime.now();
+        final long nowMs = System.currentTimeMillis();
 
         // 1. 监控 → 开播（mock：概率；real：B站 get_info 真实探测 0→1 开播、1→0 下播自动结束）
         final boolean real = realMode();
@@ -131,16 +177,38 @@ public class PipelineOrchestrator {
                 if (!Boolean.TRUE.equals(room.getMonitorEnabled())) continue;
                 if ("RECORDING".equals(room.getStatus())) {
                     if (real) {
-                        // 真实模式：录制中的房间检测下播（1→0）→ 结束会话进入 ANALYZE
-                        LiveEvent ev = streamMonitor.check(room);
-                        if (!ev.isLive()) {
-                            List<RecordingSession> actives = sessionMapper.selectList(
-                                    Wrappers.<RecordingSession>lambdaQuery()
-                                            .eq(RecordingSession::getRoomId, room.getId())
-                                            .eq(RecordingSession::getStatus, "RECORDING"));
-                            for (RecordingSession s : actives) {
-                                log.info("真实监控检测到下播，自动结束会话 session={} room={}", s.getId(), room.getId());
-                                pipeline.finishSession(s);
+                        // 房间挂着"录制中"却没有任何进行中的会话（进程被强杀后由启动收尾把会话关了，
+                        // 或历史数据状态没跟回来）：不修正就永远卡在这个状态，再也不会起新录制。
+                        long activeSessions = sessionMapper.selectCount(
+                                Wrappers.<RecordingSession>lambdaQuery()
+                                        .eq(RecordingSession::getRoomId, room.getId())
+                                        .eq(RecordingSession::getStatus, "RECORDING"));
+                        if (activeSessions == 0) {
+                            room.setStatus("MONITORING");
+                            roomMapper.updateById(room);
+                            log.info("房间 {} 标记录制中但无进行中会话，已回置为监控中", room.getId());
+                            continue;
+                        }
+                        // 录制中的房间按下播间隔（而非每 tick）探测下播：轮询越密越容易被平台限流，
+                        // 而一次限流失败过去会被当成"下播"，把正在正常录制的会话打断重建。
+                        if (nowMs - lastLiveCheckAt.getOrDefault(room.getId(), 0L) >= downCheckIntervalMs()) {
+                            lastLiveCheckAt.put(room.getId(), nowMs);
+                            LiveEvent ev = streamMonitor.check(room);
+                            // 只有平台明确回答"未开播"才收摊；查询失败=状态未知，让录制继续跑
+                            if (ev.isKnown() && !ev.isLive()) {
+                                List<RecordingSession> actives = sessionMapper.selectList(
+                                        Wrappers.<RecordingSession>lambdaQuery()
+                                                .eq(RecordingSession::getRoomId, room.getId())
+                                                .eq(RecordingSession::getStatus, "RECORDING"));
+                                for (RecordingSession s : actives) {
+                                    if (s.getStartedAt() != null
+                                            && s.getStartedAt().isAfter(now.minusSeconds(START_GRACE_SEC))) {
+                                        log.info("会话刚起录，忽略本次下播判定 session={} room={}", s.getId(), room.getId());
+                                        continue;
+                                    }
+                                    log.info("真实监控确认下播，自动结束会话 session={} room={}", s.getId(), room.getId());
+                                    pipeline.finishSession(s);
+                                }
                             }
                         }
                     }
@@ -223,11 +291,11 @@ public class PipelineOrchestrator {
             }
             if ("PENDING".equals(j.getStatus())) {
                 Integer cap = switch (j.getJobType()) {
-                    case "ANALYZE" -> capAnalyze;
-                    case "RENDER" -> capRender;
+                    case "ANALYZE" -> limitAnalyze;
+                    case "RENDER" -> limitRender;
                     default -> null;
                 };
-                if (cap != null && runningCount(j.getJobType()) >= cap) {
+                if (cap != null && busyCount(j.getJobType(), real) >= cap) {
                     jobMapper.updateById(j);
                     continue;
                 }
@@ -242,6 +310,29 @@ public class PipelineOrchestrator {
                 continue;
             }
             if ("RUNNING".equals(j.getStatus())) {
+                if (real) {
+                    // 真实引擎不做假进度/随机失败：job 一进入 RUNNING 就当轮交付重活线程池执行。
+                    // 过去每 3s tick 才涨 12~35 的假进度，一个分析要 4~8 轮（12~25s）才真正开跑，
+                    // 还有 4% 随机"引擎超时"把好好的录制 job 刷成 FAILED 反复重试。
+                    if ("RECORD".equals(j.getJobType())) {
+                        RecordingSession s = sessionMapper.selectById(j.getEntityId());
+                        if (s == null || !"RECORDING".equals(s.getStatus())) {
+                            j.setStatus("SUCCESS");
+                            j.setProgress(100);
+                            j.setFinishedAt(now);
+                            j.setLog(nvl(j.getLog()) + "；录制会话已结束");
+                            jobMapper.updateById(j);
+                        }
+                        continue; // 进度由第 2 步按真实录制时长写入
+                    }
+                    j.setProgress(100);
+                    j.setStatus("SUCCESS");
+                    j.setFinishedAt(now);
+                    j.setLog(nvl(j.getLog()) + "；交由真实引擎执行");
+                    jobMapper.updateById(j);
+                    submitHeavy(j, now);
+                    continue;
+                }
                 if (MockSupport.chance(0.04)) {
                     j.setStatus("FAILED");
                     j.setLog(nvl(j.getLog()) + "；模拟异常：引擎超时");
@@ -321,7 +412,7 @@ public class PipelineOrchestrator {
         }
     }
 
-    /** server.mjs reviewDone */
+    /** server.mjs reviewDone：审核完成后进入「待审」状态，等待人工审片（改标题/标签/描述后点通过） */
     private void reviewDone(Work w, LocalDateTime now) {
         List<String> sensitive = parseSensitiveWords(settings.getStr("sensitive_words", ""));
         ReviewRules rules = new ReviewRules(
@@ -340,25 +431,28 @@ public class PipelineOrchestrator {
         r.setCreatedAt(now);
         reviewMapper.insert(r);
 
-        if ("AUTO_PASS".equals(d.getDecision())) {
-            w.setStatus("APPROVED");
-            w.setUpdatedAt(now);
-            workMapper.updateById(w);
-            if (settings.getBool("auto_publish", true)) {
-                PublishAccount account = settings.getJson(SettingsServiceImpl.KEY_PUBLISH_ACCOUNT, PublishAccount.class);
-                if (account != null) pipeline.queuePublish(w);
-            }
-        } else if ("AUTO_REJECT".equals(d.getDecision())) {
+        if ("AUTO_REJECT".equals(d.getDecision())) {
             w.setStatus("REJECTED");
             w.setUpdatedAt(now);
             workMapper.updateById(w);
+            return;
         }
+        // AUTO_PASS 或不确定：统一进 PENDING_REVIEW，等人工审片改标题/标签后点「通过并发布」
+        w.setStatus("PENDING_REVIEW");
+        w.setUpdatedAt(now);
+        workMapper.updateById(w);
+        log.info("作品 {} 审核完成({})，进入待审状态，等待人工审片", w.getId(), d.getDecision());
     }
 
     private long runningCount(String jobType) {
         return jobMapper.selectCount(Wrappers.<PipelineJob>lambdaQuery()
                 .eq(PipelineJob::getJobType, jobType)
                 .eq(PipelineJob::getStatus, "RUNNING"));
+    }
+
+    /** 某类 job 当前占用中的数量：mock 看表里的 RUNNING 行，real 看已提交未完成的重活 */
+    private int busyCount(String jobType, boolean real) {
+        return real ? inFlightCount(jobType) : (int) runningCount(jobType);
     }
 
     /** 敏感词黑名单：一行一词 */

@@ -59,6 +59,7 @@ public class RoomServiceImpl implements RoomService {
         room.setMonitorEnabled(BodyUtils.boolVal(body, "monitor_enabled", true));
         room.setAutoRecord(BodyUtils.boolVal(body, "auto_record", true));
         room.setAutoPublish(BodyUtils.boolVal(body, "auto_publish", true));
+        room.setPublishTags(BodyUtils.str(body, "publish_tags", ""));
         room.setAnalyzeTemplate(BodyUtils.str(body, "analyze_template", "highlight"));
         room.setStatus(Boolean.TRUE.equals(room.getMonitorEnabled()) ? "MONITORING" : "OFF");
         room.setLastLiveAt(null);
@@ -87,6 +88,7 @@ public class RoomServiceImpl implements RoomService {
         }
         if (body.containsKey("auto_record")) room.setAutoRecord(BodyUtils.boolVal(body, "auto_record", room.getAutoRecord()));
         if (body.containsKey("auto_publish")) room.setAutoPublish(BodyUtils.boolVal(body, "auto_publish", room.getAutoPublish()));
+        if (body.containsKey("publish_tags")) room.setPublishTags(BodyUtils.str(body, "publish_tags", room.getPublishTags()));
         if (body.containsKey("analyze_template")) room.setAnalyzeTemplate(BodyUtils.str(body, "analyze_template", room.getAnalyzeTemplate()));
         room.setUpdatedAt(LocalDateTime.now());
         roomMapper.updateById(room);

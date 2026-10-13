@@ -11,4 +11,11 @@ public interface Renderer {
      * 否则按单一切片裁剪。模拟引擎两者都返回占位路径。
      */
     RenderResult render(Work work);
+
+    /**
+     * 只重建封面，不重编视频：改了标题或换了底图后让封面文字跟着变。
+     * 真实引擎按「作品手工底图 &gt; 房间素材 &gt; 源视频截帧」重新叠字出图；模拟引擎无封面概念，默认空实现。
+     */
+    default void buildCover(Work work) {
+    }
 }

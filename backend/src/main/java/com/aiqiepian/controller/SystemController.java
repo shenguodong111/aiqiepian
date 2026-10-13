@@ -1,6 +1,7 @@
 package com.aiqiepian.controller;
 
 import com.aiqiepian.common.ApiResponse;
+import com.aiqiepian.engine.Recorder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.SpringApplication;
@@ -22,9 +23,11 @@ public class SystemController {
     private static final Logger log = LoggerFactory.getLogger(SystemController.class);
 
     private final ConfigurableApplicationContext context;
+    private final Recorder recorder;
 
-    public SystemController(ConfigurableApplicationContext context) {
+    public SystemController(ConfigurableApplicationContext context, Recorder recorder) {
         this.context = context;
+        this.recorder = recorder;
     }
 
     @PostMapping("/exit")
@@ -36,7 +39,18 @@ public class SystemController {
             } catch (InterruptedException ignored) {
                 Thread.currentThread().interrupt();
             }
-            SpringApplication.exit(context, () -> 0);
+            // 先把录制收尾（合并分段）再关容器：容器关闭路径上调度器可能正卡在
+            // 平台接口的 socket read 里，@PreDestroy 未必被执行，遗留分片会让整场录制不可分析。
+            try {
+                recorder.drainForShutdown();
+            } catch (Exception e) {
+                log.warn("退出前收尾录制异常: {}", e.toString());
+            }
+            try {
+                SpringApplication.exit(context, () -> 0);
+            } catch (Exception e) {
+                log.warn("Spring 容器关闭异常，仍继续退出 JVM: {}", e.toString(), e);
+            }
             System.exit(0);
         }, "graceful-exit");
         t.setDaemon(false);

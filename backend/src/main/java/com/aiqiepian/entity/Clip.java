@@ -40,5 +40,7 @@ public class Clip {
     /** PENDING/RENDERED/DISCARDED */
     private String status;
     private String filePath;
+    /** 内容指纹：约 8 帧 8×8 灰度平均哈希拼接的 hex，用于轮播/重复内容去重（real 模式才有值） */
+    private String fingerprint;
     private LocalDateTime createdAt;
 }

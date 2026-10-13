@@ -9,6 +9,7 @@ import Pagination from '../components/Pagination.vue'
 import Modal from '../components/Modal.vue'
 import MediaPlayer from '../components/MediaPlayer.vue'
 import { WORK_STATUS, SUBTITLE_STYLES, ASPECTS, fmtDuration, fmtTime } from '../utils/format'
+import { useCoverImage } from '../utils/cover'
 
 const router = useRouter()
 const list = ref([])
@@ -25,7 +26,11 @@ const busy = ref(null)
 const suggesting = ref(false)
 const titleHint = ref('') // AI 生成依据（kind/summary）
 const playWork = ref(null) // 正在预览成片的 work
+const coverBusy = ref(false)
+const coverTick = ref(0) // 本地重新合成封面后自增：穿透缓存并让此前失败的图重试一次
 let timer = null
+
+const { url: coverSrc, shown: coverShown, onError: onCoverError } = useCoverImage(coverTick)
 
 function play(w) { playWork.value = w }
 function onCoverClick(w) {
@@ -77,9 +82,37 @@ async function saveEdit() {
   try {
     await http.put(`/works/${editing.value.work.id}`, { ...f, title: f.title.trim() })
     toast.success('作品已保存')
+    coverTick.value++ // 后端已按新标题重合成封面，让预览穿透缓存
     editing.value = null
     load(true)
   } catch { /* http 已 toast */ } finally { saving.value = false }
+}
+
+// 单作品封面底图：只影响这一支稿件，房间素材仍是批量默认
+async function onCoverPick(e) {
+  const f = e.target.files && e.target.files[0]
+  e.target.value = ''
+  if (!f || !editing.value) return
+  coverBusy.value = true
+  try {
+    const updated = await http.upload(`/works/${editing.value.work.id}/cover`, f)
+    Object.assign(editing.value.work, updated)
+    toast.success('封面已按新底图重新合成')
+    coverTick.value++
+    load(true)
+  } catch { /* http 已 toast */ } finally { coverBusy.value = false }
+}
+
+async function clearWorkCover() {
+  if (!editing.value) return
+  coverBusy.value = true
+  try {
+    const updated = await http.del(`/works/${editing.value.work.id}/cover`)
+    Object.assign(editing.value.work, updated)
+    toast.success('已改用自动封面（房间素材 / 成片截帧）')
+    coverTick.value++
+    load(true)
+  } catch { /* http 已 toast */ } finally { coverBusy.value = false }
 }
 
 // FR-P5-05 智能标题：比赛=【战队1】VS【战队2】，日常=主播名+高频弹幕一句话
@@ -138,7 +171,8 @@ const can = (w, action) => {
   const s = w.status
   if (action === 'export') return s === 'DRAFT'
   if (action === 'submit-review') return s === 'READY'
-  if (action === 'publish') return ['READY', 'APPROVED', 'PUBLISH_FAILED'].includes(s)
+  if (action === 'approve') return ['PENDING_REVIEW', 'READY'].includes(s)
+  if (action === 'publish') return ['READY', 'APPROVED', 'PENDING_REVIEW', 'PUBLISH_FAILED'].includes(s)
   return false
 }
 
@@ -174,7 +208,8 @@ onUnmounted(() => clearInterval(timer))
       <div class="grid cols-4">
         <div v-for="w in list" :key="w.id" class="card work-card hover">
           <div class="cover-ph" :class="{ playable: w.output_path, 'no-output': !w.output_path }" @click="onCoverClick(w)" :title="w.output_path ? '播放成片' : '尚未生成成片，点击看提示'">
-            ▶<span v-if="!w.output_path" class="no-output-tag hint">未出片</span>
+            ▶<img v-if="coverShown(w)" class="cover-img" :src="coverSrc(w)" alt="" @error="onCoverError(w)" />
+            <span v-if="!w.output_path" class="no-output-tag hint">未出片</span>
             <span class="score-tag num">{{ w.score }}</span>
             <span v-if="w.status === 'RENDERING'" class="rendering-tag num">{{ renderProgress[w.id] ?? 0 }}%</span>
           </div>
@@ -191,7 +226,8 @@ onUnmounted(() => clearInterval(timer))
             <button class="btn sm" :disabled="!w.output_path" :title="w.output_path ? '播放成片' : '尚未生成成片'" @click="play(w)">▶ 播放</button>
             <button v-if="can(w, 'export')" class="btn sm primary" :disabled="busy === `${w.id}:export`" @click="act(w, 'export', '导出任务已入队')">导出成片</button>
             <button v-if="can(w, 'submit-review')" class="btn sm" :disabled="busy === `${w.id}:submit-review`" @click="act(w, 'submit-review', '已送审，进入审核中心')">送审</button>
-            <button v-if="can(w, 'publish')" class="btn sm" :class="{ primary: w.status === 'APPROVED' }" :disabled="busy === `${w.id}:publish`" @click="act(w, 'publish', '发布任务已创建')">发布</button>
+            <button v-if="can(w, 'approve')" class="btn sm primary" :disabled="busy === `${w.id}:approve`" @click="act(w, 'approve', '审片通过，已进入发布队列')">通过并发布</button>
+            <button v-if="can(w, 'publish') && !can(w, 'approve')" class="btn sm" :class="{ primary: w.status === 'APPROVED' }" :disabled="busy === `${w.id}:publish`" @click="act(w, 'publish', '发布任务已创建')">发布</button>
             <button class="btn sm ghost" @click="openEdit(w)">编辑</button>
             <button class="btn sm ghost danger" :disabled="busy === `${w.id}:delete`" @click="del(w)">删除</button>
           </div>
@@ -213,12 +249,25 @@ onUnmounted(() => clearInterval(timer))
       </div>
       <label class="field"><span>简介</span><textarea class="input" v-model="editing.form.description" placeholder="支持 {房间} {日期} 等变量文案"></textarea></label>
       <label class="field"><span>标签（逗号分隔，≤10 个）</span><input class="input" v-model="editing.form.tags" placeholder="直播切片,AI剪辑" /></label>
-      <label class="field"><span>封面</span>
+      <div class="field-block">
+        <span class="field-title">封面</span>
         <div class="cover-upload">
-          <div class="cover-thumb">图</div>
-          <button class="btn sm" @click="toast.info('封面上传为本期占位，将使用自动生成的封面')">更换封面（占位）</button>
+          <div class="cover-thumb">
+            <img v-if="coverShown(editing.work)" :src="coverSrc(editing.work)" alt="" @error="onCoverError(editing.work)" />
+            <template v-else>图</template>
+          </div>
+          <div class="cover-actions">
+            <button class="btn sm" :disabled="coverBusy" @click="$refs.coverInput.click()">{{ coverBusy ? '合成中…' : '上传底图' }}</button>
+            <button v-if="editing.work.cover_image" class="btn sm ghost" :disabled="coverBusy" @click="clearWorkCover">改用自动封面</button>
+          </div>
         </div>
-      </label>
+        <input ref="coverInput" type="file" accept="image/jpeg,image/png,image/webp" hidden @change="onCoverPick" />
+        <span class="hint" style="font-size:11px">
+          {{ editing.work.cover_image
+            ? '本作品已指定底图，只影响这一支稿件。'
+            : '未指定时按房间素材出图，房间也没素材则用成片截帧；封面文字始终取作品标题。' }}
+        </span>
+      </div>
       <div class="form-row">
         <label class="check-line"><label class="switch"><input type="checkbox" v-model="editing.form.subtitle_enabled" /><span class="track"></span></label><span>启用字幕</span></label>
         <select class="input" v-model="editing.form.subtitle_style" :disabled="!editing.form.subtitle_enabled" style="width: 130px">
@@ -254,8 +303,11 @@ onUnmounted(() => clearInterval(timer))
 .output-path { font-size: 11px; max-width: 100%; }
 .work-foot { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
 .published-at { margin-top: 2px; }
+.cover-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; }
 .cover-upload { display: flex; align-items: center; gap: 10px; }
-.cover-thumb { width: 54px; height: 80px; border-radius: 8px; background: linear-gradient(160deg, var(--surface-2), var(--surface-3)); border: var(--border); display: flex; align-items: center; justify-content: center; color: var(--text-3); }
+.cover-thumb { position: relative; width: 128px; height: 72px; border-radius: 8px; overflow: hidden; background: linear-gradient(160deg, var(--surface-2), var(--surface-3)); border: var(--border); display: flex; align-items: center; justify-content: center; color: var(--text-3); }
+.cover-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.cover-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .form-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .check-line { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
 .field-block { display: block; margin-bottom: 12px; }

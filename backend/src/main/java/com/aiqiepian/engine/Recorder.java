@@ -37,4 +37,12 @@ public interface Recorder {
     default boolean probeAlive(RecordingSession session) {
         return true;
     }
+
+    /**
+     * 进程退出前收尾所有仍在录制的会话（停 ffmpeg、合并分片、回写时长）。
+     * 正常由容器 @PreDestroy 调用；一键停止额外显式调用一次，避免关闭流程被其它环节卡住时
+     * 录制分片没收尾而整段丢失。实现必须幂等。
+     */
+    default void drainForShutdown() {
+    }
 }

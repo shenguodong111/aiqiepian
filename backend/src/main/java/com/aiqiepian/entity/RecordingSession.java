@@ -23,8 +23,10 @@ public class RecordingSession {
     private LocalDateTime endedAt;
     /** 目标时长（秒），mock 随机 25-90 */
     private Integer durationSec;
-    /** 已录时长（秒），tick 推进 */
+    /** 已录时长（秒），真实模式收尾时=最终文件实际捕获时长（非墙钟） */
     private Integer recordedSec;
+    /** 断流重连次数（斗鱼/虎牙监管模式；B站单进程恒 0） */
+    private Integer reconnectCount;
     private String filePath;
     private Long fileSizeBytes;
     /** NONE/PENDING/RUNNING/DONE */

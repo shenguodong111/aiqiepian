@@ -12,10 +12,9 @@ import java.util.regex.Pattern;
 
 /**
  * 智能标题生成（FR-P5-05）。
- * 比赛切片：直播间名 +【战队1】VS【战队2】+ 时刻后缀（战队名从官方直播标题解析）；
- * 主播日常切片：主播精简名 + 高频弹幕汇总成一句话（数据来源 clip.top_danmaku，FR-P4-06）；
- * 无弹幕统计时回退通用模板。
- * 接入本地大模型（ai_mode=local）时：弹幕摘要、投稿简介优先用模型生成，失败静默回退纯规则。
+ * 风格参考 B站 DOTA2 UP主「三蛆」：文学梗/戏剧化/冒号金句/叙事体，标题必带主播名字。
+ * 比赛切片：直播间名 +【战队1】VS【战队2】+ 时刻后缀；
+ * 主播日常切片：本地大模型按三蛆风格生成，失败回退规则模板。
  */
 @Component
 public class TitleGenerator {
@@ -44,6 +43,28 @@ public class TitleGenerator {
     private static final Pattern ANCHOR_NOISE = Pattern.compile(
             "(官方直播间|官方|录播|回放|直播中|房间号|直播间|[:：|｜].*)$");
 
+    /**
+     * 三蛆风格标题模板（规则回退用）。
+     * {anchor} = 主播精简名, {action} = 动作/事件, {detail} = 细节
+     */
+    private static final String[] SANQU_TEMPLATES = {
+            "多年以后，{anchor}回忆起{action}的那一幕",
+            "十步杀一人，{anchor}{action}全场看呆",
+            "恐惧将至，{anchor}{action}一波带走",
+            "天上{anchor}在天上飞，地上对手在地上追",
+            "{anchor}：{action}，这波直接封神",
+            "看着{anchor}{action}，弹幕全疯了",
+            "{anchor}{action}，对面直接破防",
+            "逆风翻盘！{anchor}{action}全场沸腾",
+            "{anchor}{action}，这才是真正的操作",
+            "当{anchor}开始{action}，比赛已经结束了",
+    };
+
+    /** 动作词池（按分数/场景选） */
+    private static final String[] HIGH_ACTIONS = {"天秀操作秀翻全场", "1打5逆风翻盘", "神级走位秀麻了", "极限反杀看呆观众"};
+    private static final String[] MID_ACTIONS = {"精彩操作引爆弹幕", "高能瞬间全场沸腾", "关键一波直接起飞"};
+    private static final String[] LOW_ACTIONS = {"有趣瞬间笑麻了", "名场面来了", "精彩对决不容错过"};
+
     public Result suggest(Clip clip) {
         return suggest(clip, true);
     }
@@ -61,39 +82,53 @@ public class TitleGenerator {
             String title = clamp(base + "【" + t1 + "】VS【" + t2 + "】" + moment);
             return new Result(title, "esports", "比赛切片：从直播标题解析出对阵双方");
         }
-        // 非比赛切片：优先用本地大模型结合"看点 + 弹幕 + 精彩度"写一个爆款标题（daily/generic 都适用）
+        // 非比赛切片：优先用本地大模型按三蛆风格写标题
         if (allowLlm && llm.available()) {
             String ai = catchyTitle(clip, liveTitle);
             if (ai != null && !ai.isBlank()) {
-                return new Result(clamp(ai), "ai", "本地大模型结合看点与弹幕生成");
+                // 后处理：确保标题包含主播名字
+                ai = ensureAnchorInTitle(ai, clip, liveTitle);
+                return new Result(clamp(ai), "ai", "本地大模型三蛆风格生成");
             }
         }
+        // 规则回退：三蛆风格模板
+        String anchor = shortAnchor(clip.getAnchorName(), liveTitle);
         String sentence = danmakuSentence(topDanmakuWords(clip.getTopDanmaku(), 5));
         if (sentence != null) {
-            String anchor = shortAnchor(clip.getAnchorName(), liveTitle);
-            return new Result(clamp(anchor + "高能瞬间，" + sentence), "daily", sentence);
+            String action = pickAction(clip);
+            String title = applyTemplate(anchor, action, sentence);
+            return new Result(clamp(title), "daily", "三蛆风格规则生成");
         }
         String hook = momentSuffix(clip);
-        String fallback = trim(liveTitle) + " " + hook + "名场面";
+        String fallback = anchor + " " + hook + "名场面";
         return new Result(clamp(fallback), "generic", "未采集到弹幕统计，使用通用模板");
     }
 
-    /** 本地大模型爆款标题：只喂干净的语境（主播/主题 + 精彩度情绪 + 观众弹幕热词），
-     *  不喂技术化的 ai_reason（小模型会原样复读"响度/场景切换"等词），失败返回 null */
+    /**
+     * 本地大模型三蛆风格标题。
+     * 喂干净的语境（主播名 + 精彩度 + 弹幕热词），prompt 里给三蛆标题范例，要求必带主播名字。
+     */
     private String catchyTitle(Clip clip, String liveTitle) {
         List<String> words = topDanmakuWords(clip.getTopDanmaku(), 8);
         int score = clip.getScore() == null ? 0 : clip.getScore();
         String mood = score >= 90 ? "天秀高光" : score >= 80 ? "精彩操作" : score >= 70 ? "高能瞬间" : "看点片段";
-        String subject = shortAnchor(clip.getAnchorName(), liveTitle);
-        String sys = "你是B站直播切片标题写手。为这位主播/这个主题的直播精彩片段写一个不超过16字的中文爆款标题："
-                + "口语化、有情绪或悬念（如 这波、直接、看呆、破防、天秀、翻车、1打5、逆风翻盘 等），贴合该游戏或直播主题；"
-                + "不要出现响度、能量、场景、帧、密度、弹幕、评分、精彩度等技术或数据词；"
-                + "不要书名号、引号、日期、编号、话题标签；只输出标题本身，不要解释。";
+        String anchor = shortAnchor(clip.getAnchorName(), liveTitle);
+        String sys = "你是B站直播切片标题写手，风格参考DOTA2知名UP主「三蛆」。\n"
+                + "三蛆标题特点：\n"
+                + "1. 文学/影视梗开头：如「多年以后，AME在一千名的局...」「十步杀一人，AME35分钟18杀...」「恐惧将至，AME恐怖利刃...」\n"
+                + "2. 戏剧化场景：如「天上猪哥在天上飞，地上森哥在地...」\n"
+                + "3. 冒号+金句：如「查理斯：毛哥要是英语好一点去雪碧，雪碧真化龙了」「超哥：等你线下见到我就知道何为帅」\n"
+                + "4. 叙事体：如「看着阿雅和乡下亲戚欢声笑语，城里...」「阿杨chalice团战平均生存时长5秒钟的...」\n"
+                + "5. 标题必须包含主播名字（如AME/森哥/查理斯/猪哥/xinq/超哥等）\n"
+                + "6. 口语化、有情绪或悬念，贴合游戏主题\n"
+                + "7. 不要出现响度、能量、场景、帧、密度、弹幕、评分、精彩度等技术词\n"
+                + "8. 不要书名号、引号、日期、编号、话题标签\n"
+                + "9. 只输出标题本身（不超过20字），不要解释。";
         StringBuilder u = new StringBuilder();
-        u.append("主播/主题：").append(subject).append('\n');
+        u.append("主播名字：").append(anchor).append("（标题必须包含此名字）\n");
         u.append("片段类型：").append(mood).append('\n');
         if (!words.isEmpty()) u.append("观众常刷的词：").append(String.join("、", words)).append('\n');
-        return llm.oneLine(sys, u.toString(), 60, 30, 16);
+        return llm.oneLine(sys, u.toString(), 60, 30, 20);
     }
 
     /** 投稿简介生成：ai_mode=local 时让模型写一段简介；不喂技术化 ai_reason（小模型会复读），失败返回 null */
@@ -112,6 +147,27 @@ public class TitleGenerator {
         facts.append("片段类型：").append(mood).append('\n');
         if (!words.isEmpty()) facts.append("观众常刷的词：").append(String.join("、", words));
         return llm.oneLine(sys, facts.toString(), 160, 40, 120);
+    }
+
+    /** 后处理：如果 LLM 生成的标题不包含主播名字，强制插入 */
+    private static String ensureAnchorInTitle(String title, Clip clip, String liveTitle) {
+        String anchor = shortAnchor(clip.getAnchorName(), liveTitle);
+        if (anchor.isEmpty() || "主播".equals(anchor)) return title;
+        // 检查标题是否已包含主播名（不区分大小写）
+        if (title.contains(anchor)) return title;
+        // 尝试在标题开头或冒号后插入主播名
+        if (title.contains("：") || title.contains(":")) {
+            // 冒号前插入：如 "查理斯：xxx" 格式
+            int idx = title.indexOf('：') > 0 ? title.indexOf('：') : title.indexOf(':');
+            String before = title.substring(0, idx).trim();
+            String after = title.substring(idx);
+            if (before.isEmpty()) {
+                return anchor + after;
+            }
+            return before + "，" + anchor + after;
+        }
+        // 在标题开头插入
+        return anchor + " " + title;
     }
 
     /** 解析 top_danmaku JSON，返回前 k 个高频文本（c≥1，长度≤12） */
@@ -144,6 +200,25 @@ public class TitleGenerator {
         StringBuilder sb = new StringBuilder("弹幕齐刷");
         for (String w : words) sb.append("「").append(w).append("」");
         return sb.toString();
+    }
+
+    /** 根据分数选动作词 */
+    private static String pickAction(Clip clip) {
+        int score = clip.getScore() == null ? 0 : clip.getScore();
+        String[] pool = score >= 90 ? HIGH_ACTIONS : score >= 80 ? MID_ACTIONS : LOW_ACTIONS;
+        // 用 score 的个位数做伪随机选择，保证同一分数段稳定
+        int idx = Math.abs(score) % pool.length;
+        return pool[idx];
+    }
+
+    /** 应用三蛆风格模板 */
+    private static String applyTemplate(String anchor, String action, String detail) {
+        // 选模板：用 detail 长度做伪随机
+        int idx = (detail == null ? 0 : detail.length()) % SANQU_TEMPLATES.length;
+        String tpl = SANQU_TEMPLATES[idx];
+        return tpl.replace("{anchor}", anchor)
+                  .replace("{action}", action)
+                  .replace("{detail}", detail != null ? detail : "");
     }
 
     private static String momentSuffix(Clip clip) {

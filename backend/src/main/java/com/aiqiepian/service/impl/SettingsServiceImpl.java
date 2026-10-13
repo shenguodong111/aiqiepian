@@ -78,6 +78,8 @@ public class SettingsServiceImpl implements SettingsService, ApplicationRunner {
         m.put("auto_work_min_score", 70);
         // ---- 高光集锦自动成片（engine.mode=real 生效）：整录分析后自动选段拼成一支 ≤10-20min 成片 ----
         m.put("reel_enabled", true);
+        // ---- 轮播/重复内容去重（engine.mode=real 生效）：片段内容指纹比对，循环重播的同一段只剪一次 ----
+        m.put("clip_dedup_enabled", true);
         m.put("sensitive_words", "");
         m.put("manual_on_uncertain", true);
         m.put("auto_publish", true);

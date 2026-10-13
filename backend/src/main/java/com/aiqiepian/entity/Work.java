@@ -15,12 +15,16 @@ public class Work {
     @TableId(type = IdType.AUTO)
     private Long id;
     private Long clipId;
+    /** 归属房间：房间级封面素材按此挑选（历史作品可能为 null） */
+    private Long roomId;
     private String roomName;
     private String title;
     private String description;
     /** 逗号分隔，≤10 个 */
     private String tags;
     private String coverPath;
+    /** 人工为单个作品指定的封面底图；为空则用房间素材，房间也无素材则用成片截帧 */
+    private String coverImage;
     private Boolean subtitleEnabled;
     /** big/outline/none */
     private String subtitleStyle;

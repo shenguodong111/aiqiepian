@@ -9,6 +9,7 @@ import com.aiqiepian.entity.Work;
 import com.aiqiepian.engine.Analyzer;
 import com.aiqiepian.engine.Recorder;
 import com.aiqiepian.engine.Renderer;
+import com.aiqiepian.engine.real.ClipFingerprint;
 import com.aiqiepian.engine.model.PublishAccount;
 import com.aiqiepian.mapper.ClipMapper;
 import com.aiqiepian.mapper.LiveRoomMapper;
@@ -106,7 +107,15 @@ public class PipelineServiceImpl implements PipelineService {
         s.setCreatedAt(LocalDateTime.now());
         // 先落库拿到自增 id：真实引擎需要用 sessionId 命名录制文件并登记进程句柄
         sessionMapper.insert(s);
-        recorder.start(s, manual);
+        try {
+            recorder.start(s, manual);
+        } catch (RuntimeException e) {
+            // 起录失败（取不到流地址 / 平台限流）时这行会话永远不会有对应文件。
+            // 留着它，下个 tick 会把这个"录制中"会话当正常结束再走一遍收尾+分析，
+            // 白烧一个 session id 还产出空分析——直接回滚这行。
+            sessionMapper.deleteById(s.getId());
+            throw e;
+        }
         sessionMapper.updateById(s);
 
         room.setStatus("RECORDING");
@@ -150,26 +159,103 @@ public class PipelineServiceImpl implements PipelineService {
 
     @Override
     public List<Clip> applyAnalysis(RecordingSession s) {
-        s.setAnalyzeStatus("DONE");
+        // 分析真的跑起来了才标 RUNNING，跑完才标 DONE：中途进程被重启时这一行还停在 RUNNING，
+        // 启动恢复（PipelineRecovery）就能认出"被掐断的分析"并补排一次。
+        s.setAnalyzeStatus("RUNNING");
         sessionMapper.updateById(s);
 
         List<Clip> clips = analyzer.analyze(s);
         String dir = settings.getStr("media_dir", "./media");
-        int minScore = settings.getInt("auto_work_min_score", 70);
+
+        // 轮播/重复内容去重：real 模式下给每个候选片段算内容指纹，与该房间已有片段+本批次已收片段比对，
+        // 命中近似重复则跳过（不入库、不成片、不进集锦），使循环重播的同一段只会被剪一次。
+        boolean dedup = realMode() && settings.getBool("clip_dedup_enabled", true);
+        File source = dedup ? existingFile(s.getFilePath()) : null;
+        if (dedup && source == null) {
+            log.info("片段去重跳过：会话 {} 无可用录制文件", s.getId());
+            dedup = false;
+        }
+        // 指纹库排除本会话：这一会话的旧候选马上就要被替换，拿它们比对会把新结果整批误判为重复。
+        List<String> knownFp = dedup ? existingFingerprints(s.getRoomId(), s.getId()) : new ArrayList<>();
+
+        // 旧候选的清除放在"新片段即将入库"这一刻，而不是分析之前：
+        // 分析要跑几分钟，先删再算的话一旦这期间进程被关/线程被中断，旧片段没了、新片段也没进来，
+        // 这个会话就直接退回"零片段"（实测 852/820/821 都这么丢过）。
+        dropStaleClips(s);
+
+        List<Clip> accepted = new ArrayList<>();
         for (Clip c : clips) {
+            if (dedup) {
+                String fp = ClipFingerprint.compute(source, nz(c.getStartSec()), nz(c.getEndSec()));
+                if (fp != null && matchesAny(fp, knownFp)) {
+                    log.info("片段去重：clip[{}-{}] 与已有片段内容重复，跳过（room={} session={}）",
+                            c.getStartSec(), c.getEndSec(), s.getRoomId(), s.getId());
+                    continue;
+                }
+                c.setFingerprint(fp);
+                if (fp != null) knownFp.add(fp); // 本批次内后续片段也要与之比对（录制内循环）
+            }
             c.setCreatedAt(LocalDateTime.now());
             clipMapper.insert(c);
             c.setFilePath(dir + "/clips/clip_" + c.getId() + ".mp4");
             clipMapper.updateById(c);
-            if (c.getScore() != null && c.getScore() >= minScore) {
-                makeWork(c);
-            }
+            accepted.add(c);
+            // 不再为每个片段自动生成「照搬单片段」的作品；作品统一由下方 makeReelWork 把多个精彩片段
+            // 拼接成一支高光集锦成片。片段分析页仍可对任意单个片段手动「生成作品」。
         }
         // 高光集锦：real 模式下每次录制分析完成后自动产出一支选段拼接成片（时长随录制总时长自适应）
         if (realMode() && settings.getBool("reel_enabled", true)) {
-            makeReelWork(s, clips);
+            makeReelWork(s, accepted);
         }
-        return clips;
+        s.setAnalyzeStatus("DONE");
+        sessionMapper.updateById(s);
+        return accepted;
+    }
+
+    /** 片段去重相似度阈值：>= 此值判为同一段内容 */
+    private static final double DEDUP_SIMILARITY = 0.85;
+
+    /**
+     * 重新分析前先回收该会话上一轮的候选片段：否则旧切片（往往是更早算法产出的等长铺满段）会和
+     * 新结果叠在同一个列表里，既看不出这次到底选了什么，也可能被手动成片误选。
+     * 只清还「没人用」的：已建过作品、已被人工标记（采纳/废弃）的片段保留。
+     */
+    private void dropStaleClips(RecordingSession s) {
+        List<Clip> prior = clipMapper.selectList(Wrappers.<Clip>lambdaQuery()
+                .eq(Clip::getSessionId, s.getId()));
+        int removed = 0;
+        for (Clip c : prior) {
+            if (!"PENDING".equals(c.getStatus())) continue;
+            long used = workMapper.selectCount(Wrappers.<Work>lambdaQuery().eq(Work::getClipId, c.getId()));
+            if (used > 0) continue;
+            File f = existingFile(c.getFilePath());
+            if (f != null && !f.delete()) log.debug("旧片段文件未能删除: {}", f);
+            clipMapper.deleteById(c.getId());
+            removed++;
+        }
+        if (removed > 0) log.info("重新分析 session={}：清理上一轮候选片段 {} 个", s.getId(), removed);
+    }
+
+    /** 该房间历史片段的指纹（最多取最近 3000 条，覆盖轮播循环足够）；excludeSessionId 用于排除即将被替换的本会话旧候选 */
+    private List<String> existingFingerprints(Long roomId, Long excludeSessionId) {
+        if (roomId == null) return new ArrayList<>();
+        List<Clip> prior = clipMapper.selectList(Wrappers.<Clip>lambdaQuery()
+                .select(Clip::getFingerprint)
+                .eq(Clip::getRoomId, roomId)
+                .isNotNull(Clip::getFingerprint)
+                .ne(excludeSessionId != null, Clip::getSessionId, excludeSessionId)
+                .orderByDesc(Clip::getId)
+                .last("limit 3000"));
+        List<String> fps = new ArrayList<>(prior.size());
+        for (Clip p : prior) if (p.getFingerprint() != null) fps.add(p.getFingerprint());
+        return fps;
+    }
+
+    private static boolean matchesAny(String fp, List<String> known) {
+        for (String k : known) {
+            if (ClipFingerprint.similarity(fp, k) >= DEDUP_SIMILARITY) return true;
+        }
+        return false;
     }
 
     /**
@@ -187,9 +273,10 @@ public class PipelineServiceImpl implements PipelineService {
         int recorded = s.getRecordedSec() != null && s.getRecordedSec() > 0
                 ? s.getRecordedSec()
                 : clips.stream().mapToInt(c -> c.getEndSec() == null ? 0 : c.getEndSec()).max().orElse(0);
-        int target = (int) Math.max(300, Math.min(1200, recorded / 3.0));
+        // 集锦目标：录制/3，最短 5min、最长 20min，但短录制不能倒挂要求比原片还长的集锦
+        int target = (int) Math.min(1200, Math.max(recorded / 3.0, Math.min(300, recorded * 0.6)));
 
-        // 评分降序选段（集锦优先高分），累计时长不超目标；单段本身超目标则不收
+        // 评分降序选段（集锦优先高分），累计到目标时长即收尾（最后一段允许略微超一点）
         List<Clip> byScore = new ArrayList<>(clips);
         byScore.sort(Comparator.comparingInt((Clip c) -> c.getScore() == null ? 0 : c.getScore()).reversed());
         List<Clip> chosen = new ArrayList<>();
@@ -197,9 +284,10 @@ public class PipelineServiceImpl implements PipelineService {
         for (Clip c : byScore) {
             if (c.getStartSec() == null || c.getEndSec() == null) continue;
             int dur = c.getEndSec() - c.getStartSec();
-            if (dur <= 0 || acc + dur > target) continue;
+            if (dur <= 0) continue;
             chosen.add(c);
             acc += dur;
+            if (acc >= target) break;
         }
         if (chosen.isEmpty()) {
             // 单段都超目标（极少见）：取最高分一段截到目标时长
@@ -222,10 +310,11 @@ public class PipelineServiceImpl implements PipelineService {
         String roomName = s.getRoomName() != null && !s.getRoomName().isBlank() ? s.getRoomName() : "直播";
         Work w = new Work();
         w.setClipId(chosen.get(0).getId());
+        w.setRoomId(s.getRoomId());
         w.setRoomName(s.getRoomName());
         w.setTitle("《" + roomName + "》" + todayTitleDate() + " 高光集锦");
         w.setDescription("");
-        w.setTags(settings.getStr("publish_default_tags", "直播切片,AI剪辑"));
+        w.setTags(resolveTags(s.getRoomId()));
         w.setSubtitleEnabled(false);
         w.setSubtitleStyle("none");
         w.setAspectRatio("16:9");
@@ -259,6 +348,7 @@ public class PipelineServiceImpl implements PipelineService {
                 ? clip.getRoomName() : "直播";
         Work w = new Work();
         w.setClipId(clip.getId());
+        w.setRoomId(clip.getRoomId());
         w.setRoomName(clip.getRoomName());
         // 即时返回：标题走纯规则（不等本地模型），简介先留空，随后 enrichWorkAsync 用大模型补全
         TitleGenerator.Result ts = titleGenerator.suggest(clip, false);
@@ -266,7 +356,7 @@ public class PipelineServiceImpl implements PipelineService {
                 ? roomName + " " + todayTitleDate() + " 精彩片段 #" + clip.getId()
                 : ts.title());
         w.setDescription("");
-        w.setTags(settings.getStr("publish_default_tags", "直播切片,AI剪辑"));
+        w.setTags(resolveTags(clip.getRoomId()));
         w.setSubtitleEnabled(true);
         w.setSubtitleStyle("big");
         w.setAspectRatio("9:16");
@@ -419,5 +509,16 @@ public class PipelineServiceImpl implements PipelineService {
 
     private static String todayTitleDate() {
         return java.time.LocalDate.now().format(TITLE_DATE);
+    }
+
+    /** 优先使用房间级发布标签，为空则回退全局默认 */
+    private String resolveTags(Long roomId) {
+        if (roomId != null) {
+            LiveRoom room = liveRoomMapper.selectById(roomId);
+            if (room != null && room.getPublishTags() != null && !room.getPublishTags().isBlank()) {
+                return room.getPublishTags();
+            }
+        }
+        return settings.getStr("publish_default_tags", "直播切片,AI剪辑");
     }
 }

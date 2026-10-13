@@ -58,8 +58,13 @@ public class RealAnalyzer implements Analyzer {
     private static final Pattern SCENE_LINE = Pattern.compile("pts_time:([0-9]+(?:\\.[0-9]+)?)");
     /** 场景切换阈值 */
     static final double SCENE_THRESHOLD = 0.35;
+    /** 场景探测的降采样宽度（宽=-2 保持比例）：比对用小图即可，全尺寸逐帧比对纯属浪费 */
+    static final int SCENE_PROBE_WIDTH = 480;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    /** 片段最低主播说话覆盖度：语音时间轴可用时，选出的每段至少要有这个比例是有人在讲话的 */
+    static final double SPEECH_MIN_COVERAGE = 0.2;
 
     private final SettingsService settings;
     private final LiveRoomMapper liveRoomMapper;
@@ -98,8 +103,14 @@ public class RealAnalyzer implements Analyzer {
                 speech = asr.speechTimeline(source, duration);
             }
 
+            boolean speechGate = !speech.isEmpty();
             List<Window> windows = scoreWindows(duration, loudness, scenes, danmakuRelSec, speech);
-            List<Window> picked = nonOverlapTopK(windows);
+            List<Window> picked = nonOverlapTopK(windows, duration, speechGate);
+            if (speechGate) {
+                long talkable = windows.stream().filter(w -> w.speechCov >= SPEECH_MIN_COVERAGE).count();
+                log.info("真实分析 session={}：语音硬门槛生效，含说话窗口 {}/{}，选段 {}",
+                        session.getId(), talkable, windows.size(), picked.size());
+            }
 
             // 本地大模型增强：对候选高光重排 + 自然理由（不可用/失败静默回退启发式顺序与理由）
             boolean llmReranked = false;
@@ -147,6 +158,7 @@ public class RealAnalyzer implements Analyzer {
 
     // ---------- 主通道 a：响度曲线（ebur128 瞬时响度 M:） ----------
 
+
     List<double[]> extractLoudness(File source, double duration) {
         List<String> cmd = List.of("ffmpeg", "-hide_banner", "-loglevel", "info",
                 "-i", source.getAbsolutePath(),
@@ -174,7 +186,10 @@ public class RealAnalyzer implements Analyzer {
     // ---------- 主通道 b：场景切换点 ----------
 
     List<Double> extractSceneChanges(File source, double duration) {
-        String vf = "select=gt(scene\\," + SCENE_THRESHOLD + "),showinfo";
+        // 先降帧到 3fps 并缩到 480 宽再做场景比对：直播切片只需要知道"哪里发生了切换"，
+        // 逐帧全分辨率比对要把整片解码一遍（40 分钟的录制实测要多跑十几分钟）。
+        // 采样后 showinfo 的 pts_time 落在 1/3 秒网格上，作为选段定位精度足够。
+        String vf = "fps=3,scale=" + SCENE_PROBE_WIDTH + ":-2,select=gt(scene\\," + SCENE_THRESHOLD + "),showinfo";
         List<String> primary = List.of("ffmpeg", "-hide_banner", "-loglevel", "info",
                 "-i", source.getAbsolutePath(), "-vf", vf, "-fps_mode", "vfr", "-an", "-f", "null", "-");
         List<Double> times = new ArrayList<>();
@@ -344,11 +359,14 @@ public class RealAnalyzer implements Analyzer {
         }
     }
 
-    /** 窗口宽度自适应（≥90s 文件：duration/4 钳 30–150s；短样本：duration/3），步长 win/2，滑动打分 */
+    /**
+     * 滑窗打分。步长取 1/4 窗宽：过去用半窗步长，"互不重叠"的候选必然落回首尾相接的等长切片，
+     * 看起来像把整片切碎而不是挑出高光；细步长让峰值能被定位到准确位置。
+     */
     List<Window> scoreWindows(double duration, List<double[]> loudness, List<Double> scenes,
                               List<Integer> danmakuRelSec, List<double[]> speech) {
         double win = pickWindow(duration);
-        double step = Math.max(5, win / 2);
+        double step = Math.max(5, win / 4);
         boolean hasDanmaku = !danmakuRelSec.isEmpty();
         boolean hasSpeech = speech != null && !speech.isEmpty();
 
@@ -397,30 +415,55 @@ public class RealAnalyzer implements Analyzer {
         return windows;
     }
 
-    /** 窗口宽度：≥90s 的文件取 duration/4 并钳制 30–150s；短样本取 duration/3（≥10s） */
+    /**
+     * 窗口宽度：≥90s 的文件取 duration/8 并钳制 25–60s；短样本取 duration/3（≥10s）。
+     * 原来钳到 150s，一场长直播切出来的"高光"会是两分半的大块头，不像切片更像章节。
+     */
     static double pickWindow(double duration) {
         if (duration >= 90) {
-            return Math.max(30, Math.min(150, duration / 4));
+            return Math.max(25, Math.min(60, duration / 8));
         }
         return Math.max(10, duration / 3);
     }
 
-    /** 非重叠贪心 Top 3–8：按 base 降序选不重叠窗口，上限 8；候选充足时保证至少 3 */
-    List<Window> nonOverlapTopK(List<Window> windows) {
+    /**
+     * 选段：按分数降序做非重叠贪心，段数随录制时长自适应（够拼出一支高光集锦即可，不铺满整片）。
+     *
+     * <p>分数下限取 {@code min(中位数, 最高分*0.7)}：分布平坦时卡在最高分之下，陡峭时约在中位。
+     * 旧实现按"中位与最高分的中点"卡线，遇到整场分数接近的直播就只剩 1 段，集锦拼不出多个片段；
+     * 更早的实现没有门槛还硬性凑数，于是把整片等长切碎、每段都 90+，等于没有筛选。
+     *
+     * @param speechGate 语音时间轴可用时要求每段都有主播说话（覆盖度 ≥ {@link #SPEECH_MIN_COVERAGE}）
+     */
+    List<Window> nonOverlapTopK(List<Window> windows, double duration, boolean speechGate) {
         List<Window> sorted = new ArrayList<>(windows);
         sorted.sort(Comparator.comparingDouble((Window w) -> w.base).reversed());
+        if (sorted.isEmpty()) return List.of();
+        double maxBase = sorted.get(0).base;
+        double median = sorted.get(sorted.size() / 2).base;
+        double floor = Math.min(median, maxBase * 0.7);
+        int target = targetClipCount(duration);
+
         List<Window> picked = new ArrayList<>();
         for (Window w : sorted) {
-            if (picked.size() >= 8) break;
+            if (picked.size() >= target) break;
+            if (speechGate && w.speechCov < SPEECH_MIN_COVERAGE) continue;
+            if (!picked.isEmpty() && w.base < floor) continue;
             boolean overlap = picked.stream().anyMatch(o -> w.start < o.end && o.start < w.end);
             if (!overlap) picked.add(w);
         }
-        for (Window w : sorted) { // 极端短文件兜底，凑够最少 3 个
-            if (picked.size() >= Math.min(3, sorted.size())) break;
-            if (!picked.contains(w)) picked.add(w);
-        }
         picked.sort(Comparator.comparingDouble((Window w) -> w.start));
         return picked;
+    }
+
+    /**
+     * 目标段数：让选出的片段总时长约等于集锦目标时长（与 PipelineServiceImpl.makeReelWork 同源——
+     * 集锦目标 = clamp(录制/3, 最短5min, 最长20min)，但不超过录制本身的大部分）。
+     */
+    static int targetClipCount(double duration) {
+        double win = pickWindow(duration);
+        double reel = Math.min(Math.max(duration / 3.0, Math.min(300, duration * 0.6)), 1200);
+        return (int) Math.max(1, Math.min(16, Math.ceil(reel / win)));
     }
 
     /** 归一化得分映射到 60–98 */

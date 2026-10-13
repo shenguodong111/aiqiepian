@@ -152,9 +152,32 @@ ALTER TABLE clip ADD COLUMN IF NOT EXISTS unique_users INT;
 ALTER TABLE clip ADD COLUMN IF NOT EXISTS top_danmaku VARCHAR(1000);
 ALTER TABLE clip ADD COLUMN IF NOT EXISTS anchor_name VARCHAR(100);
 
+-- ---------- 轮播去重：片段内容指纹（8×8 灰度关键帧平均哈希，hex） ----------
+ALTER TABLE clip ADD COLUMN IF NOT EXISTS fingerprint VARCHAR(500);
+
+-- ---------- 断流可见性：录制会话记录断流重连次数 ----------
+ALTER TABLE recording_session ADD COLUMN IF NOT EXISTS reconnect_count INT;
+
 -- ---------- 高光集锦成片：整录自动选段拼接 ----------
 ALTER TABLE work ADD COLUMN IF NOT EXISTS source_path VARCHAR(500);
 ALTER TABLE work ADD COLUMN IF NOT EXISTS reel_segments VARCHAR(1000);
 
 -- ---------- 房间备注名与直播标题分离：备注名不再被直播标题覆盖 ----------
 ALTER TABLE live_room ADD COLUMN IF NOT EXISTS live_title VARCHAR(200);
+
+-- ---------- 房间级发布标签：发布到 B站 时自动带上话题标签 ----------
+ALTER TABLE live_room ADD COLUMN IF NOT EXISTS publish_tags VARCHAR(500);
+
+-- ---------- 封面素材库：主播图片素材 + 标题文字合成封面（房间未配素材则退回成片截帧 + 文字） ----------
+CREATE TABLE IF NOT EXISTS cover_asset (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    room_id    BIGINT       NOT NULL,
+    file_path  VARCHAR(500),
+    file_name  VARCHAR(200),
+    created_at TIMESTAMP
+);
+
+-- work.room_id：房间级封面素材按作品归属房间挑选（建作品时从会话/片段带过来）
+-- work.cover_image：人工为单个作品指定的封面底图，优先级高于房间素材
+ALTER TABLE work ADD COLUMN IF NOT EXISTS room_id BIGINT;
+ALTER TABLE work ADD COLUMN IF NOT EXISTS cover_image VARCHAR(500);

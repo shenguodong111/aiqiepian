@@ -147,7 +147,7 @@ public class RealPublisher implements Publisher {
             progressSink.accept(95);
             updateProgress(taskId, 95);
             String desc = renderDesc(work);
-            String cover = settings.getStr("publish_cover_url", "");
+            String cover = resolveCoverUrl(work);
             String bvid = bili.submitArchive(work.getTitle(), work.getTags(), desc,
                     cover == null || cover.isBlank() ? null : cover, upload, mid);
 
@@ -169,6 +169,27 @@ public class RealPublisher implements Publisher {
     }
 
     // ---------- 内部 ----------
+
+    /**
+     * 稿件封面：优先上传本作品已生成的封面（素材图或截帧 + 标题文字），
+     * 无文件/上传失败则退回全局 publish_cover_url（仍为空就由 B站 自行取帧）。
+     */
+    private String resolveCoverUrl(Work work) {
+        String path = work.getCoverPath();
+        if (path != null && !path.isBlank()) {
+            File f = new File(path.replace('/', java.io.File.separatorChar));
+            if (f.isFile() && f.length() > 0) {
+                try {
+                    return bili.uploadCover(f);
+                } catch (Exception e) {
+                    log.warn("作品 {} 封面上传失败，改用全局封面或平台自动取帧: {}", work.getId(), e.toString());
+                }
+            } else {
+                log.warn("作品 {} 封面文件不存在: {}（改用全局封面或平台自动取帧）", work.getId(), path);
+            }
+        }
+        return settings.getStr("publish_cover_url", "");
+    }
 
     private void markUploading(long taskId) {
         taskMapper.update(null, Wrappers.<PublishTask>lambdaUpdate()

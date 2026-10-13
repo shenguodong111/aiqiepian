@@ -35,7 +35,11 @@ public class RealStreamMonitor implements StreamMonitor {
         String roomId = "huya".equals(platform)
                 ? HuyaApi.resolveRoomId(HuyaApi.extractRoomToken(room))
                 : BilibiliApi.extractRoomId(room);
-        if (roomId == null) return new LiveEvent(false);
+        if (roomId == null) {
+            // 虎牙 roomId 要靠抓房间页解析，抓不到是网络/反爬问题，不代表下播
+            log.warn("真实监控解析房间号失败，状态未知 room={}", room.getRoomUrl());
+            return LiveEvent.unknown();
+        }
 
         long now = System.currentTimeMillis();
         Cached cached = cache.get(room.getId());
@@ -48,8 +52,8 @@ public class RealStreamMonitor implements StreamMonitor {
             case "bilibili" -> {
                 Object[] info = BilibiliApi.getRoomInfo(roomId);
                 if (info == null) {
-                    log.warn("真实监控查询失败，按未开播处理 room={}", roomId);
-                    event = new LiveEvent(false);
+                    log.warn("真实监控查询失败，直播状态未知（不判为下播）room={}", roomId);
+                    event = LiveEvent.unknown();
                 } else {
                     String title = (String) info[1];
                     event = new LiveEvent(((Integer) info[0]) == 1, title == null || title.isEmpty() ? null : title);
@@ -58,8 +62,8 @@ public class RealStreamMonitor implements StreamMonitor {
             case "douyu" -> {
                 Object[] info = DouyuApi.getRoomInfo(roomId);
                 if (info == null) {
-                    log.warn("douyu 开播检测失败，按未开播处理 room={}", roomId);
-                    event = new LiveEvent(false);
+                    log.warn("douyu 开播检测失败，直播状态未知（不判为下播）room={}", roomId);
+                    event = LiveEvent.unknown();
                 } else {
                     String title = (String) info[1];
                     event = new LiveEvent(((Integer) info[0]) == 1, title == null || title.isEmpty() ? null : title);
@@ -68,8 +72,8 @@ public class RealStreamMonitor implements StreamMonitor {
             case "huya" -> {
                 Object[] info = HuyaApi.getRoomInfo(roomId);
                 if (info == null) {
-                    log.warn("huya 开播检测失败，按未开播处理 room={}", roomId);
-                    event = new LiveEvent(false);
+                    log.warn("huya 开播检测失败，直播状态未知（不判为下播）room={}", roomId);
+                    event = LiveEvent.unknown();
                 } else {
                     String title = (String) info[1];
                     event = new LiveEvent(((Integer) info[0]) == 1, title == null || title.isEmpty() ? null : title);

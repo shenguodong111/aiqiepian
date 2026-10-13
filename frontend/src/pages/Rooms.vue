@@ -21,6 +21,11 @@ const saving = ref(false)
 const modal = ref(null) // { room|null, form }
 const confirmDel = ref(null)
 
+// 封面素材：该主播的图片底图，成片封面 = 素材图 + 标题文字；一张都没有则退回截帧加字
+const assets = ref([])
+const assetBusy = ref(false)
+const assetInput = ref(null)
+
 const URL_RULES = {
   bilibili: { re: /live\.bilibili\.com\/\d+/i, hint: 'https://live.bilibili.com/房间号' },
   douyu: { re: /douyu\.com\/\d+|douyu\.com\/profile/i, hint: 'https://www.douyu.com/房间号' },
@@ -43,11 +48,44 @@ function resetFilters() { filters.platform = ''; filters.status = ''; filters.kw
 function openAdd() {
   modal.value = {
     room: null,
-    form: { platform: 'bilibili', room_url: '', room_name: '', anchor_name: '', monitor_enabled: true, auto_record: true, auto_publish: true, analyze_template: 'highlight' },
+    form: { platform: 'bilibili', room_url: '', room_name: '', anchor_name: '', monitor_enabled: true, auto_record: true, auto_publish: true, analyze_template: 'highlight', publish_tags: '' },
   }
+  assets.value = []
 }
 function openEdit(room) {
   modal.value = { room, form: { ...room } }
+  loadAssets(room.id)
+}
+
+async function loadAssets(roomId) {
+  assets.value = []
+  if (!roomId) return
+  try { assets.value = await http.get('/cover-assets', { room_id: roomId }, { silent: true }) }
+  catch { assets.value = [] }
+}
+
+async function onAssetPick(e) {
+  const files = [...(e.target.files || [])]
+  e.target.value = ''
+  const room = modal.value?.room
+  if (!room) return toast.error('请先保存直播间，再上传封面素材')
+  if (!files.length) return
+  assetBusy.value = true
+  let ok = 0
+  for (const f of files) {
+    try { await http.upload('/cover-assets', f, { room_id: room.id }); ok++ } catch { /* http 已 toast */ }
+  }
+  assetBusy.value = false
+  if (ok) toast.success(`已上传 ${ok} 张封面素材`)
+  loadAssets(room.id)
+}
+
+async function delAsset(a) {
+  try {
+    await http.del(`/cover-assets/${a.id}`)
+    toast.success('封面素材已删除')
+    if (modal.value?.room) loadAssets(modal.value.room.id)
+  } catch { /* http 已 toast */ }
 }
 
 function validateUrl(form) {
@@ -68,6 +106,7 @@ async function saveModal() {
     const body = {
       platform: f.platform, room_url: f.room_url, room_name: f.room_name, anchor_name: f.anchor_name,
       monitor_enabled: f.monitor_enabled, auto_record: f.auto_record, auto_publish: f.auto_publish ?? true, analyze_template: f.analyze_template,
+      publish_tags: f.publish_tags || '',
     }
     if (modal.value.room) {
       await http.put(`/rooms/${modal.value.room.id}`, body)
@@ -253,6 +292,28 @@ onMounted(load)
           <option v-for="(label, k) in ANALYZE_TEMPLATES" :key="k" :value="k">{{ label }}</option>
         </select>
       </label>
+      <label class="field"><span>发布标签（逗号分隔，发布到 B站 时自动作为话题带上）</span>
+        <input class="input" v-model="modal.form.publish_tags" placeholder="电子竞技,DOTA2,刀塔" />
+        <span class="hint" style="font-size:11px">留空则使用全局默认标签</span>
+      </label>
+      <div class="field">
+        <span>封面素材（主播图片，可多张）</span>
+        <div class="asset-row">
+          <div v-for="a in assets" :key="a.id" class="asset-thumb" :title="a.file_name">
+            <img :src="`/api/media/stream?type=asset&id=${a.id}`" :alt="a.file_name" />
+            <button class="asset-del" title="删除该素材" @click="delAsset(a)">×</button>
+          </div>
+          <button class="btn sm" :disabled="assetBusy || !modal.room" @click="$refs.assetInput.click()">
+            {{ assetBusy ? '上传中…' : '＋ 上传图片' }}
+          </button>
+        </div>
+        <input ref="assetInput" type="file" accept="image/jpeg,image/png,image/webp" multiple hidden @change="onAssetPick" />
+        <span class="hint" style="font-size:11px">
+          <template v-if="!modal.room">保存直播间后即可上传封面素材。</template>
+          <template v-else-if="assets.length">封面用这 {{ assets.length }} 张图 + 标题文字，按作品轮换，同一主播多条稿件不重样。</template>
+          <template v-else>未上传素材时，封面自动用成片截帧 + 标题文字。</template>
+        </span>
+      </div>
       <div class="switch-lines">
         <label class="check-line"><label class="switch"><input type="checkbox" v-model="modal.form.monitor_enabled" /><span class="track"></span></label><span>开启监控（默认开）</span></label>
         <label class="check-line"><label class="switch"><input type="checkbox" v-model="modal.form.auto_record" /><span class="track"></span></label><span>开播自动录制（默认开）</span></label>
@@ -278,6 +339,13 @@ onMounted(load)
 
 <style scoped>
 .rooms-page { display: flex; flex-direction: column; gap: 4px; }
+div.field { display: block; margin-bottom: 12px; }
+div.field > span { display: block; font-size: 12px; color: var(--text-2); margin-bottom: 5px; }
+.asset-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.asset-thumb { position: relative; width: 96px; height: 54px; border-radius: 6px; overflow: hidden; border: var(--border); }
+.asset-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.asset-del { position: absolute; top: 0; right: 0; width: 18px; height: 18px; padding: 0; line-height: 16px; border: 0; border-radius: 0 0 0 6px; background: rgba(0, 0, 0, 0.62); color: #fff; font-size: 13px; cursor: pointer; }
+.asset-del:hover { background: #d0342c; }
 .batch-bar { display: flex; align-items: center; gap: 10px; padding: 10px 16px; margin-bottom: 12px; font-size: 13px; }
 .room-card { padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
 .room-card.checked { border-color: rgba(12, 143, 161, 0.55); }

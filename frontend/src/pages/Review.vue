@@ -8,6 +8,7 @@ import EmptyState from '../components/EmptyState.vue'
 import Modal from '../components/Modal.vue'
 import MediaPlayer from '../components/MediaPlayer.vue'
 import { REVIEW_DECISION, WORK_STATUS, fmtTime } from '../utils/format'
+import { useCoverImage } from '../utils/cover'
 
 const tab = ref('pending') // pending | approved | rejected | records
 const pending = ref([])
@@ -15,6 +16,8 @@ const approved = ref([])
 const rejected = ref([])
 const records = ref([])
 const reviewByWork = ref({})
+// 审片时标题和封面要一起过目：缩略图直接读后端已合成的封面产物
+const { url: coverSrc, shown: coverShown, onError: onCoverError } = useCoverImage()
 const loading = ref(true)
 const rejectModal = ref(null) // { work }
 const rejectReason = ref('')
@@ -139,7 +142,9 @@ onMounted(load)
     <!-- 作品卡列表 -->
     <div v-else class="grid cols-2">
       <div v-for="w in currentList" :key="w.id" class="card review-card">
-        <button class="cover-ph" style="width: 86px; flex: none; cursor: pointer" @click="play(w)" title="播放成片">▶</button>
+        <div class="cover-ph review-cover" @click="play(w)" title="播放成片">
+          ▶<img v-if="coverShown(w)" class="cover-img" :src="coverSrc(w)" alt="" @error="onCoverError(w)" />
+        </div>
         <div class="review-body">
           <div class="review-title trunc" :title="w.title">{{ w.title }}</div>
           <div class="review-meta">
@@ -209,6 +214,8 @@ onMounted(load)
 .review-page { display: flex; flex-direction: column; }
 .table-wrap { padding: 6px 14px 14px; overflow-x: auto; }
 .review-card { padding: 14px 16px; display: flex; gap: 14px; align-items: flex-start; }
+.review-cover { width: 86px; flex: none; cursor: pointer; }
+.review-cover .cover-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .review-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
 .review-title { font-weight: 600; font-size: 13.5px; max-width: 100%; }
 .review-meta { display: flex; align-items: center; gap: 10px; }

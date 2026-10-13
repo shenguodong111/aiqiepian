@@ -164,7 +164,10 @@ watch(drawer, (s) => { if (s) loadDrawerClips(s.id) })
             <td>{{ s.room_name || '房间#' + s.room_id }}</td>
             <td class="num muted">{{ fmtTime(s.started_at) }}</td>
             <td class="num muted">{{ fmtTime(s.ended_at) }}</td>
-            <td class="num">{{ fmtDuration(s.duration_sec) }}</td>
+            <td class="num">
+              {{ fmtDuration(s.recorded_sec || s.duration_sec) }}
+              <span v-if="s.reconnect_count > 0" class="badge orange" :title="'断流重连 ' + s.reconnect_count + ' 次（斗鱼/虎牙边缘节点切断，已自动重连拼接）'">断流 {{ s.reconnect_count }}</span>
+            </td>
             <td><span class="trunc hint" :title="s.file_path">{{ s.file_path || '--' }}</span></td>
             <td>
               <span class="badge" :class="{ NONE: 'gray', PENDING: 'orange', RUNNING: 'cyan', DONE: 'green' }[s.analyze_status] || 'gray'">

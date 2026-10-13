@@ -15,6 +15,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 import java.util.Map;
@@ -60,10 +61,34 @@ public class WorkController {
         return ApiResponse.ok(workService.publish(id));
     }
 
+    /** 审片通过：PENDING_REVIEW → APPROVED，自动发布开启时入队发布 */
+    @PostMapping("/{id}/approve")
+    public ApiResponse<Work> approve(@PathVariable long id) {
+        return ApiResponse.ok(workService.approve(id));
+    }
+
     /** FR-P5-05 智能标题建议：{title, kind, summary}，前端填入编辑框后可改名再发布 */
     @PostMapping("/{id}/suggest-title")
     public ApiResponse<Map<String, Object>> suggestTitle(@PathVariable long id) {
         return ApiResponse.ok(workService.suggestTitle(id));
+    }
+
+    /** 为单个作品上传封面底图（优先于房间素材），保存后立即重合成「图片 + 标题」封面 */
+    @PostMapping("/{id}/cover")
+    public ApiResponse<Work> setCover(@PathVariable long id, @RequestParam("file") MultipartFile file) {
+        return ApiResponse.ok(workService.setCoverImage(id, file));
+    }
+
+    /** 清除该作品的手工封面底图，回到「房间素材 &gt; 成片截帧」自动策略并重合成 */
+    @DeleteMapping("/{id}/cover")
+    public ApiResponse<Work> clearCover(@PathVariable long id) {
+        return ApiResponse.ok(workService.clearCoverImage(id));
+    }
+
+    /** 只重合成封面（改了标题后让封面文字跟上），不重编视频 */
+    @PostMapping("/{id}/cover/rebuild")
+    public ApiResponse<Work> rebuildCover(@PathVariable long id) {
+        return ApiResponse.ok(workService.rebuildCover(id));
     }
 
     /** 删除作品（连带文件/审核/发布记录）；已发布需 force=true；delete_files=false 仅删记录不删盘 */

@@ -27,6 +27,8 @@ public class LiveRoom {
     private Boolean autoRecord;
     /** 房间级自动发布开关：审核通过后是否自动进入发布队列（全局 settings.auto_publish 仍需为真） */
     private Boolean autoPublish;
+    /** 发布标签（逗号分隔）：发布到 B站 时自动作为话题标签带上，为空则用全局默认 */
+    private String publishTags;
     /** highlight/full/clip */
     private String analyzeTemplate;
     /** OFF/IDLE/MONITORING/RECORDING */
