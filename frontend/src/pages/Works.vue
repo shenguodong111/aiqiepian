@@ -60,6 +60,22 @@ async function loadClipDurations() {
   } catch { /* 忽略 */ }
 }
 
+/**
+ * 作品时长：成片实测值优先。集锦是多段拼的，过去直接拿 w.clip_id 那一个片段的时长显示，
+ * 420 秒的集锦会显示成 1 分钟；老数据没有 duration_sec 时按选段区间求和兜底。
+ */
+function workDuration(w) {
+  if (w.duration_sec != null && w.duration_sec > 0) return w.duration_sec
+  if (w.reel_segments) {
+    const sum = String(w.reel_segments).split(';').reduce((acc, pair) => {
+      const [s, e] = pair.split(',').map(Number)
+      return acc + (e > s ? e - s : 0)
+    }, 0)
+    if (sum > 0) return sum
+  }
+  return clipDurations.value[w.clip_id] ?? null
+}
+
 function openEdit(w) {
   if (w.status === 'PUBLISHED') return toast.info('已发布作品为只读')
   titleHint.value = ''
@@ -216,7 +232,7 @@ onUnmounted(() => clearInterval(timer))
           <div class="work-title" :title="w.title">{{ w.title }}</div>
           <div class="work-meta">
             <span class="badge" :class="WORK_STATUS[w.status]?.cls">{{ WORK_STATUS[w.status]?.label || w.status }}</span>
-            <span class="hint num">{{ clipDurations[w.clip_id] != null ? fmtDuration(clipDurations[w.clip_id]) : '--' }} · {{ ASPECTS[w.aspect_ratio] || w.aspect_ratio }}</span>
+            <span class="hint num">{{ workDuration(w) != null ? fmtDuration(workDuration(w)) : '--' }} · {{ ASPECTS[w.aspect_ratio] || w.aspect_ratio }}</span>
           </div>
           <div v-if="w.status === 'RENDERING'" class="progress stripe" style="margin: 4px 0 2px">
             <i :style="{ width: (renderProgress[w.id] ?? 0) + '%' }"></i>

@@ -34,6 +34,8 @@ public class Work {
     private String status;
     private String outputPath;
     private Integer score;
+    /** 成片自身时长（渲染完成后由引擎实测回填，单位秒）；集锦不能用单片段时长代替 */
+    private Integer durationSec;
     /** 高光集锦：源录制文件绝对路径；非单切片作品为 null */
     private String sourcePath;
     /** 高光集锦裁切区间，格式 "start,end;start,end"（秒）；非集锦为 null */

@@ -117,6 +117,9 @@ public class PipelineOrchestrator {
     /** 走重活池的环节（真会跑 ffmpeg/Whisper 的） */
     private static final Set<String> HEAVY_TYPES = Set.of("ANALYZE", "RENDER");
 
+    /** 由线程池执行的环节：真实模式下 RUNNING 交给接手的线程写，排队中的不抢标 */
+    private static final Set<String> POOLED_TYPES = Set.of("ANALYZE", "RENDER", "REVIEW");
+
     @PostConstruct
     void initExecutor() {
         int size = Math.max(1, settings.getInt("max_concurrent_heavy", 2));
@@ -158,6 +161,7 @@ public class PipelineOrchestrator {
         (heavy ? heavyExecutor : lightExecutor).submit(() -> {
             String note;
             boolean ok;
+            if (realMode()) markRunning(jobId, j.getJobType());
             try {
                 onJobSuccess(j, now);
                 ok = true;
@@ -173,6 +177,17 @@ public class PipelineOrchestrator {
             }
             if (realMode()) finishJob(jobId, ok, note, j.getJobType(), j.getEntityType(), j.getEntityId());
         });
+    }
+
+    /** 线程真正接手时才标 RUNNING：排队中的 job 保持 PENDING，界面不会把"还没开始"显示成"进行中" */
+    private void markRunning(long jobId, String jobType) {
+        PipelineJob cur = jobMapper.selectById(jobId);
+        if (cur == null || !"PENDING".equals(cur.getStatus())) return;
+        cur.setStatus("RUNNING");
+        cur.setStartedAt(LocalDateTime.now());
+        cur.setProgress(0);
+        cur.setLog(jobType + " 开始执行");
+        jobMapper.updateById(cur);
     }
 
     /**
@@ -377,6 +392,15 @@ public class PipelineOrchestrator {
                 }
                 if (!autoRun && BLOCKED_WHEN_OFF.contains(j.getJobType())) {
                     jobMapper.updateById(j);
+                    continue;
+                }
+                if (real && POOLED_TYPES.contains(j.getJobType())) {
+                    // 真实模式：排队≠开跑。过去这里直接把行标成 RUNNING，于是重活池（只有 2 线程，
+                    // 前面可能压着几小时的 ASR）还没接手，剪辑工作台卡片就已经显示"渲染中 0%"。
+                    // 现在先落 PENDING（保留上面 FAILED→PENDING 的重试计数），再由真正接手的线程写 RUNNING。
+                    j.setStatus("PENDING");
+                    jobMapper.updateById(j);
+                    submitHeavy(j, now);
                     continue;
                 }
                 j.setStatus("RUNNING");

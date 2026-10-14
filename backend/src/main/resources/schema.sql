@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS work (
     status           VARCHAR(20) DEFAULT 'DRAFT',
     output_path      VARCHAR(500),
     score            INT,
+    duration_sec     INT,
     created_at       TIMESTAMP,
     updated_at       TIMESTAMP
 );
@@ -179,5 +180,7 @@ CREATE TABLE IF NOT EXISTS cover_asset (
 
 -- work.room_id：房间级封面素材按作品归属房间挑选（建作品时从会话/片段带过来）
 -- work.cover_image：人工为单个作品指定的封面底图，优先级高于房间素材
+-- 作品自身时长（成片真实秒数）：集锦由多段拼成，不能用单个片段的时长代替
+ALTER TABLE work ADD COLUMN IF NOT EXISTS duration_sec INT;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS room_id BIGINT;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS cover_image VARCHAR(500);

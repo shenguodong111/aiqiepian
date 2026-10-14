@@ -175,6 +175,16 @@ function statOr(v) { return v === null || v === undefined ? '--' : v }
 function gotoRecordings() { router.push('/recordings') }
 
 onMounted(() => { load(); loadOptions() })
+
+/**
+ * 会话总时长（秒）：recorded_sec 才是真实录到的秒数，duration_sec 只是"计划录多久"的上限，
+ * 被掐断的会话它仍停在 4 小时——过去这里还把 duration_sec 当分钟又乘 60，显示成 240:00:00。
+ */
+function sessionTotalSec(id) {
+  const s = sessions.value.find(x => x.id === id)
+  if (!s) return 0
+  return s.recorded_sec || s.duration_sec || 0
+}
 </script>
 
 <template>
@@ -281,7 +291,7 @@ onMounted(() => { load(); loadOptions() })
 
     <!-- 编辑时间弹窗 -->
     <Modal v-if="editClip" title="编辑片段时间范围" @close="editClip = null">
-      <p class="hint" style="margin-bottom: 14px">修改后时长自动重算（单位：秒）。会话总时长 {{ fmtDuration((sessions.find(s => s.id === editClip.clip.session_id)?.duration_sec || 0) * 60) }}。</p>
+      <p class="hint" style="margin-bottom: 14px">修改后时长自动重算（单位：秒）。会话总时长 {{ fmtDuration(sessionTotalSec(editClip.clip.session_id)) }}。</p>
       <div class="time-inputs">
         <label class="field"><span>起始（秒）</span><input class="input num" type="number" min="0" v-model.number="editClip.form.start_sec" /></label>
         <span class="eq">→</span>

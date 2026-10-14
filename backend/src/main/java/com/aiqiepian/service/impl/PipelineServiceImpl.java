@@ -322,6 +322,8 @@ public class PipelineServiceImpl implements PipelineService {
         w.setAspectRatio("16:9");
         w.setStatus("DRAFT");
         w.setScore(topScore);
+        // 建作品即写入选段总长，渲染完成后 renderDone 会用成片实测值覆盖
+        w.setDurationSec(acc);
         w.setOutputPath(null);
         w.setSourcePath(source.getAbsolutePath());
         w.setReelSegments(spec.toString());
@@ -373,6 +375,7 @@ public class PipelineServiceImpl implements PipelineService {
         w.setAspectRatio("9:16");
         w.setStatus("DRAFT");
         w.setScore(clip.getScore());
+        w.setDurationSec(clip.getDurationSec()); // 单片段作品：成片长度即片段长度（16:9 重剪后误差在秒级）
         w.setOutputPath(null);
         LocalDateTime now = LocalDateTime.now();
         w.setCreatedAt(now);
@@ -420,7 +423,11 @@ public class PipelineServiceImpl implements PipelineService {
     public void renderDone(Work w) {
         w.setStatus("READY");
         w.setUpdatedAt(LocalDateTime.now());
-        w.setOutputPath(renderer.render(w).getOutputPath());
+        String out = renderer.render(w).getOutputPath();
+        w.setOutputPath(out);
+        // 实测成片长度：集锦由多段拼成，界面若拿单片段时长显示会严重偏小（实测 420s 的集锦显示成 1 分钟）
+        int dur = renderer.probeDurationSec(out);
+        if (dur > 0) w.setDurationSec(dur);
         workMapper.updateById(w);
         addJob("REVIEW", "work", w.getId());
     }

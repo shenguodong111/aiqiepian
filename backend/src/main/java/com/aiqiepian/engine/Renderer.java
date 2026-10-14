@@ -13,6 +13,16 @@ public interface Renderer {
     RenderResult render(Work work);
 
     /**
+     * 实测某产物文件的时长（秒）。真实引擎用 ffprobe 读，模拟引擎没有真文件 → 返回 0 表示"不知道"，
+     * 调用方保留原值即可。作品列表要显示的是**成片**长度，不是某个片段的长度。
+     *
+     * @return 秒数；未知或失败返回 0
+     */
+    default int probeDurationSec(String path) {
+        return 0;
+    }
+
+    /**
      * 只重建封面，不重编视频：改了标题或换了底图后让封面文字跟着变。
      * 真实引擎按「作品手工底图 &gt; 房间素材 &gt; 源视频截帧」重新叠字出图；模拟引擎无封面概念，默认空实现。
      */

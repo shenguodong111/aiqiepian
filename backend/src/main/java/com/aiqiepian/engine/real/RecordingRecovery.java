@@ -78,6 +78,10 @@ public class RecordingRecovery implements ApplicationRunner {
             if ("RECORDING".equals(s.getStatus())) {
                 s.setStatus("FINISHED");
                 s.setEndedAt(LocalDateTime.now());
+                // duration_sec 存的是"计划录多久"（上限常为 4 小时），会话被掐断后它仍停在上限，
+                // 界面拿它当总时长就会显示成 240:00；收尾时按实际录到的秒数收口。
+                int real = s.getRecordedSec() == null ? 0 : s.getRecordedSec();
+                if (real > 0 && (s.getDurationSec() == null || s.getDurationSec() > real)) s.setDurationSec(real);
                 boolean queueAnalysis = "NONE".equals(nvl(s.getAnalyzeStatus())) || s.getAnalyzeStatus() == null;
                 if (queueAnalysis) s.setAnalyzeStatus("PENDING");
                 sessionMapper.updateById(s);

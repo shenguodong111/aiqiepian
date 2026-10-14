@@ -133,7 +133,7 @@ function makeWork(clip, auto) {
     title: st.title,
     description: '', tags: db.settings.publish_default_tags, cover_path: `${db.settings.media_dir}/covers/work_${seq}_cover.jpg`,
     subtitle_enabled: true, subtitle_style: 'big', aspect_ratio: '9:16',
-    status: 'DRAFT', score: clip.score, output_path: null, created_at: now(), updated_at: now() }
+    status: 'DRAFT', score: clip.score, duration_sec: clip.duration_sec ?? null, output_path: null, created_at: now(), updated_at: now() }
   db.works.push(w)
   if (!auto) addJob('RENDER', 'work', w.id)
   else addJob('RENDER', 'work', w.id)

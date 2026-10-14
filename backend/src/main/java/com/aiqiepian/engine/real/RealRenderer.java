@@ -123,6 +123,16 @@ public class RealRenderer implements Renderer {
         return new RenderResult(out.toString());
     }
 
+    /** 成片时长以文件实测为准（集锦是逐段拼的，估算值会与真实长度有偏差） */
+    @Override
+    public int probeDurationSec(String path) {
+        if (path == null || path.isBlank()) return 0;
+        File f = new File(path.replace('/', java.io.File.separatorChar));
+        if (!f.isFile()) return 0;
+        double sec = FfmpegSupport.probeDuration(f);
+        return sec > 0 ? (int) Math.round(sec) : 0;
+    }
+
     /** 只重建封面（改了标题/换了底图）：重新定位源与区间后走同一套封面优先级 */
     @Override
     public void buildCover(Work work) {
