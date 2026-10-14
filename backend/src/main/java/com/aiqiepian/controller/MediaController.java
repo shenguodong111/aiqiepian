@@ -56,6 +56,13 @@ public class MediaController {
         return ApiResponse.ok(mediaService.deleteSelected(category, ids, force));
     }
 
+    /** 删除影响预览（确认框用它显示连带删除量）。body {category, ids:[..]} */
+    @PostMapping("/delete-impact")
+    public ApiResponse<Map<String, Object>> deleteImpact(@RequestBody Map<String, Object> body) {
+        return ApiResponse.ok(mediaService.deleteImpact(
+                BodyUtils.str(body, "category", null), BodyUtils.longList(body, "ids")));
+    }
+
     /**
      * 一键清理冗余。body 可选：{keep_per_session:int=3, delete_files:bool=true, purge_orphans:bool=true}。
      * 每会话只留最高分前 N 片段（多余片段连同作品/记录/文件删除），可清孤儿磁盘文件；已发布内容与房间不动。

@@ -1,5 +1,6 @@
 package com.aiqiepian.service.impl;
 
+import com.aiqiepian.common.BizException;
 import com.aiqiepian.entity.Clip;
 import com.aiqiepian.entity.LiveRoom;
 import com.aiqiepian.entity.PipelineJob;
@@ -409,6 +410,66 @@ public class PipelineServiceImpl implements PipelineService {
 
         addJob("RENDER", "work", w.getId());
         enrichWorkAsync(w.getId(), clip.getId());
+        return w;
+    }
+
+    /**
+     * 手工拼接同一场录像的多个片段：与自动集锦走同一条产物路径（reel_segments → 逐段切段 concat），
+     * 差别只在于选哪几段由人决定，所以不再按分数挑段、也不卡目标时长。
+     */
+    @Override
+    public Work makeStitchWork(List<Clip> clips) {
+        Clip first = clips.get(0);
+        RecordingSession s = first.getSessionId() == null ? null : sessionMapper.selectById(first.getSessionId());
+        if (s == null) throw new BizException("这些片段所属的录制会话不存在");
+        File source = existingFile(s.getFilePath());
+        if (source == null) throw new BizException("该录像的原始文件已不在磁盘上，无法拼接：" + s.getFilePath());
+
+        List<Clip> ordered = new ArrayList<>(clips);
+        ordered.sort(Comparator.comparingInt(c -> c.getStartSec() == null ? 0 : c.getStartSec()));
+        StringBuilder spec = new StringBuilder();
+        int acc = 0;
+        for (Clip c : ordered) {
+            if (spec.length() > 0) spec.append(';');
+            spec.append(c.getStartSec()).append(',').append(c.getEndSec());
+            acc += c.getEndSec() - c.getStartSec();
+        }
+        Clip best = ordered.stream()
+                .max(Comparator.comparingInt(c -> c.getScore() == null ? 0 : c.getScore()))
+                .orElse(ordered.get(0));
+        int topScore = best.getScore() == null ? 0 : best.getScore();
+
+        String roomName = s.getRoomName() != null && !s.getRoomName().isBlank() ? s.getRoomName() : "直播";
+        TitleGenerator.Result ts = titleGenerator.suggest(best, false);
+        String title = ts.title() != null && !ts.title().isBlank()
+                ? ts.title() : shortRoomLabel(roomName) + " 精选拼接";
+
+        Work w = new Work();
+        w.setClipId(best.getId());          // 标题/封面/简介精修都以分数最高的那段为语境
+        w.setRoomId(s.getRoomId());
+        w.setRoomName(s.getRoomName());
+        w.setTitle(title);
+        w.setDescription("");
+        w.setTags(resolveTags(s.getRoomId()));
+        w.setSubtitleEnabled(false);        // 多段拼接保持画面连贯，与自动集锦一致不逐句烧字幕
+        w.setSubtitleStyle("none");
+        w.setAspectRatio("16:9");
+        w.setStatus("DRAFT");
+        w.setScore(topScore);
+        w.setDurationSec(acc);
+        w.setOutputPath(null);
+        w.setSourcePath(source.getAbsolutePath());
+        w.setReelSegments(spec.toString());
+        LocalDateTime now = LocalDateTime.now();
+        w.setCreatedAt(now);
+        w.setUpdatedAt(now);
+        workMapper.insert(w);
+        w.setCoverPath(settings.getStr("media_dir", "./media") + "/covers/work_" + w.getId() + "_cover.jpg");
+        workMapper.updateById(w);
+
+        addJob("RENDER", "work", w.getId());
+        enrichWorkAsync(w.getId(), best.getId());
+        log.info("手工拼接作品已创建 work={} 段={} 预计={}s session={}", w.getId(), ordered.size(), acc, s.getId());
         return w;
     }
 

@@ -26,6 +26,12 @@ public interface PipelineService {
     /** server.mjs makeWork：建 DRAFT 作品并入队 RENDER job */
     Work makeWork(Clip clip);
 
+    /**
+     * 手工拼接：把**同一场录像**里的若干片段按时间顺序拼成一支作品（片段分析页勾选后触发）。
+     * 复用自动高光集锦的产物机制（work.reel_segments → RealRenderer 逐段切段 concat）。
+     */
+    Work makeStitchWork(java.util.List<Clip> clips);
+
     /** server.mjs renderDone：READY + 产物路径 + 入队 REVIEW */
     void renderDone(Work work);
 

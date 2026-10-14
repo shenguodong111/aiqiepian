@@ -31,11 +31,12 @@ public class ClipController {
 
     @GetMapping
     public ApiResponse<PageResult<Clip>> list(@RequestParam(required = false) Long sessionId,
+                                              @RequestParam(required = false) Long roomId,
                                               @RequestParam(required = false) Integer minScore,
                                               @RequestParam(required = false) String status,
                                               @RequestParam(required = false) Integer page,
                                               @RequestParam(required = false) Integer size) {
-        return ApiResponse.ok(clipService.list(sessionId, minScore, status, page, size));
+        return ApiResponse.ok(clipService.list(sessionId, roomId, minScore, status, page, size));
     }
 
     /** 编辑时间范围 body {start_sec, end_sec} */
@@ -76,6 +77,22 @@ public class ClipController {
             }
         }
         return ApiResponse.ok(clipService.batchMakeWork(ids));
+    }
+
+    /** 手工拼接：把勾选的同场片段拼成一支作品 body {ids:[..]} */
+    @PostMapping("/stitch")
+    public ApiResponse<Work> stitch(@RequestBody Map<String, Object> body) {
+        List<Long> ids = new ArrayList<>();
+        Object raw = body.get("ids");
+        if (raw instanceof List<?> l) {
+            for (Object o : l) {
+                if (o instanceof Number n) ids.add(n.longValue());
+                else if (o != null) {
+                    try { ids.add(Long.parseLong(String.valueOf(o))); } catch (NumberFormatException ignored) { }
+                }
+            }
+        }
+        return ApiResponse.ok(clipService.stitch(ids));
     }
 
     /** 删除片段（级联删其派生作品+文件）；含已发布作品需 force=true */

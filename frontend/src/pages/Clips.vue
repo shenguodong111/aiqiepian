@@ -25,6 +25,7 @@ const sessions = ref([])
 const FILTER_KEY = 'clips.filters'
 const saved = (() => { try { return JSON.parse(localStorage.getItem(FILTER_KEY) || '{}') } catch { return {} } })()
 const filters = reactive({
+  roomId: route.query.roomId || '',
   sessionId: route.query.sessionId || '',
   minScore: Number.isFinite(saved.minScore) ? saved.minScore : 0,
   status: saved.status || '',
@@ -38,11 +39,26 @@ function play(c) { playClip.value = c }
 
 async function load(silent = false) {
   try {
-    const d = await http.get('/clips', { sessionId: filters.sessionId, minScore: filters.minScore || undefined, status: filters.status, page: page.value, size }, { silent })
+    const d = await http.get('/clips', {
+      sessionId: filters.sessionId, roomId: filters.roomId,
+      minScore: filters.minScore || undefined, status: filters.status, page: page.value, size,
+    }, { silent })
     list.value = d.list
     total.value = d.total
     checked.value = new Set()
   } catch { if (!silent) toast.error('加载片段失败') } finally { loading.value = false }
+}
+
+/** 会话下拉只列当前所选主播的录像；没选主播时列全部 */
+const roomSessions = computed(() =>
+  filters.roomId ? sessions.value.filter(s => String(s.room_id) === String(filters.roomId)) : sessions.value)
+
+/** 换主播时把不属于该主播的会话筛选清掉，否则列表会空得让人以为是坏了 */
+function onRoomChange() {
+  if (filters.sessionId && !roomSessions.value.some(s => String(s.id) === String(filters.sessionId))) {
+    filters.sessionId = ''
+  }
+  applyFilters()
 }
 
 async function loadOptions() {
@@ -136,6 +152,25 @@ async function batchMake() {
   } catch { /* http 已 toast */ }
 }
 
+/** 勾选到的片段对象（用于判断能不能拼：必须同属一场录像） */
+const checkedClips = computed(() => list.value.filter(c => checked.value.has(c.id)))
+const canStitch = computed(() =>
+  checkedClips.value.length >= 2 && new Set(checkedClips.value.map(c => c.session_id)).size === 1)
+const stitchSpan = computed(() =>
+  checkedClips.value.reduce((s, c) => s + (c.duration_sec || (c.end_sec - c.start_sec)), 0))
+const stitchMixed = computed(() =>
+  checkedClips.value.length >= 2 && new Set(checkedClips.value.map(c => c.session_id)).size > 1)
+
+async function stitch() {
+  if (!canStitch.value) return toast.error('请勾选同一场录像下的至少两个片段')
+  const ids = checkedClips.value.map(c => c.id)
+  try {
+    const w = await http.post('/clips/stitch', { ids })
+    toast.success(`已拼接 ${ids.length} 段为作品《${w.title || w.id}》（约 ${fmtDuration(stitchSpan.value)}），成片任务已入队`)
+    load(true)
+  } catch { /* http 已 toast：会写明是哪两条重叠/不同场 */ }
+}
+
 async function analyzeSession() {
   if (!filters.sessionId) return
   try {
@@ -164,6 +199,32 @@ function parseTop(json) {
   try { const a = JSON.parse(json); return Array.isArray(a) ? a.filter(x => x && x.t) : [] } catch { return [] }
 }
 const rows = computed(() => list.value.map(c => ({ ...c, _top: parseTop(c.top_danmaku) })))
+
+/**
+ * 同一场录像的片段集中放在一起显示：后端已按「最新录像 → 段内时间正序」返回，
+ * 这里标出每场的第一条，在它上面插一条会话分组头，挑片段拼接时一眼能看清哪些属于同一场。
+ */
+const groupStartIds = computed(() => {
+  const seen = new Set()
+  const out = new Set()
+  for (const r of rows.value) {
+    if (!seen.has(r.session_id)) { seen.add(r.session_id); out.add(r.id) }
+  }
+  return out
+})
+
+function sessionLabel(sid) {
+  const s = sessions.value.find(x => x.id === sid)
+  if (!s) return `会话 #${sid}`
+  const dur = fmtDuration(sessionTotalSec(sid))
+  const at = (s.started_at || '').slice(5, 16).replace('T', ' ')
+  return `会话 #${sid} · ${s.room_name || ''} · ${at} 开始 · 全长 ${dur}`
+}
+
+/** 分组头上标一下这一场在当前页有几段，挑着拼的时候心里有数 */
+function sessionClipCount(sid) {
+  return rows.value.filter(c => c.session_id === sid).length
+}
 // 主播头像色块：由名字确定性哈希取色（与热度迷你柱同思路，无随机）
 function anchorColor(name) {
   let h = 0
@@ -190,10 +251,16 @@ function sessionTotalSec(id) {
 <template>
   <div class="clips-page">
     <div class="filter-bar">
-      <select class="input" v-model="filters.sessionId" @change="applyFilters" style="max-width: 260px">
-        <option value="">全部会话</option>
-        <option v-for="s in sessions" :key="s.id" :value="s.id">
-          #{{ s.id }} {{ s.room_name || '' }} · {{ (s.started_at || '').slice(5, 16) }}
+      <select class="input" v-model="filters.roomId" @change="onRoomChange" style="max-width: 190px">
+        <option value="">全部主播</option>
+        <option v-for="r in rooms" :key="r.id" :value="r.id">
+          {{ r.room_name || ('房间 #' + r.id) }}
+        </option>
+      </select>
+      <select class="input" v-model="filters.sessionId" @change="applyFilters" style="max-width: 320px">
+        <option value="">{{ filters.roomId ? '该主播的全部录像' : '全部录像' }}</option>
+        <option v-for="s in roomSessions" :key="s.id" :value="s.id">
+          #{{ s.id }} {{ (s.started_at || '').slice(5, 16).replace('T', ' ') }} · 全长 {{ fmtDuration(sessionTotalSec(s.id)) }}
         </option>
       </select>
       <label class="score-filter">
@@ -206,9 +273,14 @@ function sessionTotalSec(id) {
         <option value="RENDERED">已成片</option>
         <option value="DISCARDED">已丢弃</option>
       </select>
-      <button v-if="filters.sessionId" class="btn" @click="analyzeSession">重新分析该会话</button>
+      <button v-if="filters.sessionId" class="btn" @click="analyzeSession">重新分析该录像</button>
       <span style="flex: 1"></span>
-      <button class="btn primary" :disabled="!checked.size" @click="batchMake">批量成片（{{ checked.size }}）</button>
+      <span v-if="checked.size" class="hint stitch-hint">
+        已选 {{ checked.size }} 段 · 约 {{ fmtDuration(stitchSpan) }}
+        <b v-if="stitchMixed" class="warn">（含不同录像，不能拼在一起）</b>
+      </span>
+      <button class="btn" :disabled="!canStitch" @click="stitch">拼接成一条作品</button>
+      <button class="btn primary" :disabled="!checked.size" @click="batchMake">每段各出一个作品（{{ checked.size }}）</button>
     </div>
 
     <LoadingBlock v-if="loading" />
@@ -229,7 +301,14 @@ function sessionTotalSec(id) {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="c in rows" :key="c.id">
+            <template v-for="c in rows" :key="c.id">
+              <tr v-if="groupStartIds.has(c.id)" class="group-row">
+                <td :colspan="16">
+                  <b>{{ sessionLabel(c.session_id) }}</b>
+                  <span class="hint"> · 该场共 {{ sessionClipCount(c.session_id) }} 段（本页）</span>
+                </td>
+              </tr>
+              <tr>
               <td><input type="checkbox" :checked="checked.has(c.id)" :disabled="c.status !== 'PENDING'" @change="toggleCheck(c.id)" /></td>
               <td class="num muted">#{{ c.session_id }}</td>
               <td>{{ c.room_name || '--' }}</td>
@@ -282,7 +361,8 @@ function sessionTotalSec(id) {
                   <button class="btn sm" @click="restore(c)">恢复</button>
                 </div>
               </td>
-            </tr>
+              </tr>
+            </template>
           </tbody>
         </table>
         <Pagination :total="total" :page="page" :size="size" @update:page="p => { page = p; load(true) }" />
@@ -319,6 +399,15 @@ function sessionTotalSec(id) {
 .ai-reason { color: var(--text-2); font-size: 12.5px; max-width: 130px; display: inline-block; }
 td input[type='checkbox'] { accent-color: var(--accent); width: 14px; height: 14px; cursor: pointer; }
 .time-inputs { display: flex; align-items: flex-end; gap: 10px; }
+/* 同一场录像的分组头：让"哪些片段属于同一场"在挑段拼接时一眼可辨 */
+.group-row td {
+  background: var(--surface-2, rgba(255 255 255 / 4%));
+  border-left: 3px solid var(--accent);
+  font-size: 12.5px;
+  padding: 7px 12px;
+}
+.stitch-hint { white-space: nowrap; }
+.stitch-hint .warn { color: #ff9db1; }
 .time-inputs .field { flex: 1; margin-bottom: 0; }
 .eq { color: var(--text-3); padding-bottom: 10px; }
 /* M5 弹幕统计列（FR-P4-06） */

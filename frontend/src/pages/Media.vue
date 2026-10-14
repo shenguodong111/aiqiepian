@@ -33,13 +33,26 @@ const selected = ref(new Set())
 const delModal = ref(false)
 const delForce = ref(false)
 const deleting = ref(false)
+// 删除影响预览：勾选 N 行实际会连带删掉多少片段/作品（后端 /media/delete-impact 算好了再显示）
+const impact = ref(null)
 const CAT_LABEL = { recordings: '原始录制', clips: '片段', subtitles: '字幕', covers: '封面', works: '成片' }
 const selectedBytes = computed(() => files.value.reduce((s, f) => selected.value.has(f.ref?.id) ? s + (f.size_bytes || 0) : s, 0))
+// 预览里"会被连带删掉的作品数"：已发布的在不勾强制时受保护，不计入
+const impactWorkCount = computed(() => {
+  if (!impact.value) return 0
+  const pub = delForce.value ? 0 : (impact.value.published_works || 0)
+  return Math.max(0, (impact.value.works || 0) - pub)
+})
 const allChecked = computed(() => files.value.length > 0 && files.value.every(f => f.ref && selected.value.has(f.ref.id)))
 function toggleCheck(id) { const s = new Set(selected.value); s.has(id) ? s.delete(id) : s.add(id); selected.value = s }
 function toggleAll() { selected.value = allChecked.value ? new Set() : new Set(files.value.filter(f => f.ref).map(f => f.ref.id)) }
 function clearSelection() { selected.value = new Set() }
-function askDelete() { if (!selected.value.size) return; delForce.value = false; delModal.value = true }
+function askDelete() { if (!selected.value.size) return; delForce.value = false; impact.value = null; delModal.value = true; loadImpact() }
+async function loadImpact() {
+  try {
+    impact.value = await http.post('/media/delete-impact', { category: cat.value, ids: [...selected.value] }, { silent: true })
+  } catch { impact.value = null }
+}
 async function doDelete() {
   deleting.value = true
   try {
@@ -173,16 +186,26 @@ onMounted(() => { load(); loadStats() })
     <!-- 批量删除二次确认 -->
     <Modal v-if="delModal" title="删除确认" @close="delModal = false">
       <p style="margin-bottom: 8px">将删除所选 <b>{{ selected.size }}</b> 个<b>{{ CAT_LABEL[cat] }}</b>文件，回收约 <b class="num">{{ fmtBytes(selectedBytes) }}</b>。此操作不可恢复。</p>
+      <p v-if="impact" class="impact-line" :class="{ warn: impactWorkCount > 0 && delForce }">
+        <template v-if="cat==='recordings'">
+          <template v-if="!delForce">影响：原始录像文件删除后，会话记录、{{ impact.clips || 0 }} 个已分析片段、{{ impact.works || 0 }} 个作品<b>全部保留</b>（之后可对同一场录像重新分析）。</template>
+          <template v-else>连带影响：这 {{ impact.sessions || 0 }} 场录像的 <b>{{ impact.clips || 0 }} 个片段</b>与它们生成的 <b>{{ impactWorkCount }} 个未发布作品</b>会一起删除{{ impact.published_works ? `（${impact.published_works} 个已发布作品保留）` : '' }}。</template>
+        </template>
+        <template v-else-if="cat==='clips'">连带影响：<b>{{ impact.clips || 0 }} 个片段</b>，以及它们生成的 <b>{{ impact.works || 0 }} 个作品</b>及成片/封面/字幕文件{{ impact.published_works ? `（其中 ${impact.published_works} 个已发布，未勾强制则保留）` : '' }}。</template>
+        <template v-else-if="cat==='works'">连带影响：<b>{{ impact.works || 0 }} 个作品</b>的成片文件、封面、字幕与审核/发布记录{{ impact.published_works ? `（其中 ${impact.published_works} 个已发布，未勾强制则保留）` : '' }}。</template>
+        <template v-else>仅删除所选文件本身，不影响任何记录。</template>
+      </p>
       <p class="hint" style="margin-bottom: 10px">
-        <template v-if="cat==='recordings'">删除原始录制文件，并级联删除该会话下的片段及其作品/审核/发布记录（录制任务、片段分析、剪辑工作台等同步消失）；含已发布作品的会话默认保留记录、仅删原始文件。</template>
+        <template v-if="cat==='recordings'">默认只回收最大的原始录像占用：删磁盘文件 + 解除会话的文件引用，录制任务列表与片段分析结果都还在。确需彻底清掉这一场（含片段与作品）请勾选下面的强制项。</template>
         <template v-else-if="cat==='clips'">删除片段，并级联删除其生成的作品与成片/封面/字幕文件。</template>
         <template v-else-if="cat==='works'">删除作品，连带其成片/封面/字幕文件与审核/发布记录。</template>
         <template v-else-if="cat==='subtitles'">仅删除对应作品的字幕(.srt)源文件。</template>
         <template v-else-if="cat==='covers'">仅删除对应作品的封面图。</template>
       </p>
-      <div v-if="cat==='clips' || cat==='works'" class="check-line" style="margin-bottom: 10px">
+      <div v-if="cat==='clips' || cat==='works' || cat==='recordings'" class="check-line" style="margin-bottom: 10px">
         <label class="switch"><input type="checkbox" v-model="delForce" /><span class="track"></span></label>
-        <span>强制删除（含已发布作品，仅删本地记录，B 站稿件不受影响）</span>
+        <span v-if="cat==='recordings'">强制：连带删除这些场录像的片段与未发布作品，并抹掉会话记录（不可恢复）</span>
+        <span v-else>强制删除（含已发布作品，仅删本地记录，B 站稿件不受影响）</span>
       </div>
       <div class="modal-foot">
         <button class="btn ghost" @click="delModal = false">取消</button>
@@ -220,4 +243,6 @@ onMounted(() => { load(); loadStats() })
 .clean-list { background: #0a0a0e; border: var(--border); border-radius: 10px; padding: 10px 14px; max-height: 200px; overflow-y: auto; font-size: 12px; }
 .clean-item { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-bottom: 1px dashed rgba(255,255,255,.05); color: var(--text-2); }
 .clean-item .trunc { max-width: 380px; }
+.impact-line { font-size: 13px; color: var(--text-2); margin-bottom: 8px; }
+.impact-line.warn { color: #ff8f8f; }
 </style>

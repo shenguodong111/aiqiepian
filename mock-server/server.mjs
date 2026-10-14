@@ -59,6 +59,9 @@ function addJob(type, entityType, entityId, extra = {}) {
 }
 const jobOf = (entityType, entityId) => db.jobs.find(j => j.entity_type === entityType && j.entity_id === entityId && j.status !== 'SUCCESS' && j.status !== 'SKIPPED')
 const runningCount = t => db.jobs.filter(j => j.job_type === t && j.status === 'RUNNING').length
+/** 该会话的分析是否还在排队/执行：真后端会拒绝此时用它的片段建作品（分析会替换本轮候选片段） */
+const analyzing = sid => db.jobs.some(j => j.job_type === 'ANALYZE' && j.entity_type === 'session'
+  && j.entity_id === sid && (j.status === 'PENDING' || j.status === 'RUNNING'))
 
 // ---------- 管线调度（模拟执行） ----------
 function startLive(room, manual = false) {
@@ -399,11 +402,33 @@ const server = http.createServer(async (req, res) => {
     s.analyze_status = 'PENDING'; addJob('ANALYZE', 'session', s.id); return ok(res, true) }
   // 片段
   if (req.method === 'GET' && api === '/clips') {
-    let list = [...db.clips].reverse()
+    // 与真实后端一致：按「最新一场录像 → 段内时间正序」，同一场的片段集中显示便于挑段拼接
+    let list = [...db.clips].sort((a, b) => (b.session_id - a.session_id) || (a.start_sec - b.start_sec) || (a.id - b.id))
     if (q.sessionId) list = list.filter(c => c.session_id === +q.sessionId)
+    if (q.roomId) list = list.filter(c => c.room_id === +q.roomId)
     if (q.minScore) list = list.filter(c => c.score >= +q.minScore)
     if (q.status) list = list.filter(c => c.status === q.status)
     return ok(res, page(list, q))
+  }
+  if (api === '/clips/stitch' && req.method === 'POST') {
+    const picked = (body.ids || []).map(id => findClip(id)).filter(Boolean)
+    if (picked.length < 2) return err(res, '请至少勾选两个片段再拼接（单个片段用「生成作品」即可）')
+    if (new Set(picked.map(c => c.session_id)).size > 1) return err(res, '只能拼接同一场录像里的片段')
+    const sid0 = picked[0].session_id
+    if (analyzing(sid0)) return err(res, `会话 ${sid0} 还在分析中，等这一场分析结束再挑选片段（分析会替换掉本轮候选片段，现在拼的作品会对不上挑的时间段）`)
+    const ordered = [...picked].sort((a, b) => a.start_sec - b.start_sec)
+    for (let i = 1; i < ordered.length; i++) {
+      if (ordered[i].start_sec < ordered[i - 1].end_sec) return err(res, `片段 #${ordered[i - 1].id} 与 #${ordered[i].id} 时间重叠，请调整后再拼`)
+    }
+    for (const c of ordered) c.status = 'RENDERED'
+    const best = [...ordered].sort((a, b) => b.score - a.score)[0]
+    const w = makeWork(best, true)
+    w.reel_segments = ordered.map(c => `${c.start_sec},${c.end_sec}`).join(';')
+    w.duration_sec = ordered.reduce((s, c) => s + (c.end_sec - c.start_sec), 0)
+    w.subtitle_enabled = false
+    w.subtitle_style = 'none'
+    w.aspect_ratio = '16:9'
+    return ok(res, w)
   }
   if (m(/^\/clips\/(\d+)$/)) { const c = findClip(lastMatch[1]); if (!c) return err(res, '不存在', 404)
     if (req.method === 'PUT') { c.start_sec = body.start_sec ?? c.start_sec; c.end_sec = body.end_sec ?? c.end_sec; c.duration_sec = c.end_sec - c.start_sec; return ok(res, c) }
@@ -422,9 +447,10 @@ const server = http.createServer(async (req, res) => {
   if (m(/^\/clips\/(\d+)\/discard$/) && req.method === 'POST') { const c = findClip(lastMatch[1]); if (!c) return err(res, '不存在', 404); c.status = 'DISCARDED'; return ok(res, c) }
   if (m(/^\/clips\/(\d+)\/restore$/) && req.method === 'POST') { const c = findClip(lastMatch[1]); if (!c) return err(res, '不存在', 404); if (c.status !== 'DISCARDED') return err(res, '仅已丢弃的片段可恢复'); c.status = 'PENDING'; return ok(res, c) }
   if (m(/^\/clips\/(\d+)\/make-work$/) && req.method === 'POST') { const c = findClip(lastMatch[1]); if (!c) return err(res, '不存在', 404)
+    if (analyzing(c.session_id)) return err(res, `会话 ${c.session_id} 还在分析中，等分析结束再生成作品`)
     c.status = 'RENDERED'; return ok(res, makeWork(c, false)) }
   if (api === '/clips/batch-make-work' && req.method === 'POST') {
-    const made = (body.ids || []).map(id => findClip(id)).filter(c => c && c.status === 'PENDING').map(c => { c.status = 'RENDERED'; return makeWork(c, false) })
+    const made = (body.ids || []).map(id => findClip(id)).filter(c => c && c.status === 'PENDING' && !analyzing(c.session_id)).map(c => { c.status = 'RENDERED'; return makeWork(c, false) })
     return ok(res, made) }
   // 作品
   if (req.method === 'GET' && api === '/works') {
@@ -575,20 +601,26 @@ const server = http.createServer(async (req, res) => {
     const cat = body.category
     const ids = new Set((body.ids || []).map(Number))
     const force = !!body.force
-    let removed = 0, removedWorks = 0, skipped = 0, freed = 0
+    let removed = 0, removedWorks = 0, removedClips = 0, skipped = 0, freed = 0
     const sizeOf = (w) => w.output_path ? 80_000_000 : 0
     if (cat === 'recordings') {
-      // 级联：删会话 + 其片段 + 片段派生作品（已发布默认保留，则会话记录留、仅解除原始文件引用）
+      // 默认只回收原始录像占用（解除文件引用），会话/片段/作品全部保留；勾选强制才级联删下游
       for (const sid of [...ids]) {
         const s = db.sessions.find(x => x.id === sid); if (!s) continue
-        const clipIds = db.clips.filter(c => c.session_id === sid).map(c => c.id)
-        const delWork = w => clipIds.includes(w.clip_id) && (w.status !== 'PUBLISHED' || force)
-        for (const w of db.works) if (delWork(w)) { freed += w.output_path ? 80_000_000 : 0; removedWorks++ }
-        db.works = db.works.filter(w => !delWork(w))
-        const pubClipIds = new Set(db.works.filter(w => clipIds.includes(w.clip_id)).map(w => w.clip_id))
-        db.clips = db.clips.filter(c => !(c.session_id === sid && !pubClipIds.has(c.id)))
-        if (s.file_path) { freed += s.file_size_bytes || 0; s.file_path = null; s.file_size_bytes = 0 }
-        if (pubClipIds.size === 0) db.sessions = db.sessions.filter(x => x.id !== sid)
+        if (force) {
+          const clipIds = db.clips.filter(c => c.session_id === sid).map(c => c.id)
+          const delWork = w => clipIds.includes(w.clip_id) && w.status !== 'PUBLISHED'
+          for (const w of db.works) if (delWork(w)) { freed += w.output_path ? 80_000_000 : 0; removedWorks++ }
+          db.works = db.works.filter(w => !delWork(w))
+          const keptClipIds = new Set(db.works.filter(w => clipIds.includes(w.clip_id)).map(w => w.clip_id))
+          const delClip = c => c.session_id === sid && !keptClipIds.has(c.id)
+          for (const c of db.clips.filter(delClip)) removedClips++
+          db.clips = db.clips.filter(c => !delClip(c))
+          if (s.file_path) { freed += s.file_size_bytes || 0; s.file_path = null; s.file_size_bytes = 0 }
+          if (keptClipIds.size === 0) db.sessions = db.sessions.filter(x => x.id !== sid)
+        } else if (s.file_path) {
+          freed += s.file_size_bytes || 0; s.file_path = null; s.file_size_bytes = 0
+        }
         removed++
       }
     } else if (cat === 'subtitles') {
@@ -612,7 +644,42 @@ const server = http.createServer(async (req, res) => {
       db.clips = db.clips.filter(c => !clipIds.has(c.id))
       removed = clipIds.size
     }
-    return ok(res, { removed, removed_works: removedWorks, skipped_published: skipped, freed_bytes: freed })
+    return ok(res, {
+      removed, removed_works: removedWorks, removed_clips: removedClips,
+      skipped_published: skipped, freed_bytes: freed, cascaded: cat === 'recordings' ? force : false,
+    })
+  }
+  // 删除影响预览：确认框用它显示"勾 N 行实际会连带删掉多少片段/作品"
+  if (api === '/media/delete-impact' && req.method === 'POST') {
+    const cat = body.category
+    const ids = new Set((body.ids || []).map(Number))
+    let sessions = 0, clips = 0, works = 0, published = 0, bytes = 0
+    const worksOfClip = (cid) => db.works.filter(w => w.clip_id === cid)
+    if (cat === 'recordings') {
+      for (const sid of ids) {
+        const s = db.sessions.find(x => x.id === sid); if (!s) continue
+        sessions++
+        if (s.file_path) bytes += s.file_size_bytes || 0
+        for (const c of db.clips.filter(c => c.session_id === sid)) {
+          clips++
+          for (const w of worksOfClip(c.id)) { works++; if (w.status === 'PUBLISHED') published++ }
+        }
+      }
+    } else if (cat === 'clips') {
+      for (const cid of ids) {
+        if (!db.clips.find(c => c.id === cid)) continue
+        clips++
+        for (const w of worksOfClip(cid)) { works++; if (w.status === 'PUBLISHED') published++ }
+      }
+    } else if (cat === 'works') {
+      for (const wid of ids) {
+        const w = db.works.find(x => x.id === wid); if (!w) continue
+        works++
+        if (w.status === 'PUBLISHED') published++
+        if (w.output_path) bytes += 80_000_000
+      }
+    }
+    return ok(res, { category: cat, sessions, clips, works, published_works: published, bytes })
   }
   // 设置
   if (api === '/settings' && req.method === 'GET') return ok(res, db.settings)

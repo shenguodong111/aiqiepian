@@ -9,7 +9,7 @@ import java.util.Map;
 
 public interface ClipService {
 
-    PageResult<Clip> list(Long sessionId, Integer minScore, String status, Integer page, Integer size);
+    PageResult<Clip> list(Long sessionId, Long roomId, Integer minScore, String status, Integer page, Integer size);
 
     /** 编辑起止秒并重算时长 */
     Clip updateRange(long id, Integer startSec, Integer endSec);
@@ -22,6 +22,12 @@ public interface ClipService {
     Work makeWork(long id);
 
     List<Work> batchMakeWork(List<Long> ids);
+
+    /**
+     * 手工拼接：把勾选的多个片段拼成**一支**作品。要求同属一场录像、时间区间互不重叠，
+     * 至少两段；片段状态置为已成片，作品直接进入成片队列。
+     */
+    Work stitch(List<Long> ids);
 
     /**
      * 删除片段：级联删除其派生作品（复用作品删除语义：文件+审核/发布记录），再删片段自身文件与记录。

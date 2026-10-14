@@ -21,6 +21,8 @@ import com.aiqiepian.service.TitleGenerator;
 import com.aiqiepian.service.WorkService;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -33,6 +35,8 @@ import java.util.Map;
 @Service
 @RequiredArgsConstructor
 public class WorkServiceImpl implements WorkService {
+
+    private static final Logger log = LoggerFactory.getLogger(WorkServiceImpl.class);
 
     private final WorkMapper workMapper;
     private final ClipMapper clipMapper;
@@ -235,6 +239,9 @@ public class WorkServiceImpl implements WorkService {
         reviewRecordMapper.delete(Wrappers.<ReviewRecord>lambdaQuery().eq(ReviewRecord::getWorkId, w.getId()));
         publishTaskMapper.delete(Wrappers.<PublishTask>lambdaQuery().eq(PublishTask::getWorkId, w.getId()));
         workMapper.deleteById(w.getId());
+        // 审计：作品删除不可恢复，必须留下"谁在什么时候删了哪一支、是否连文件一起删"的痕迹
+        log.info("审计删除[作品] #{}《{}》状态={} 来源片段={} 连带删除文件={} 回收={} KB",
+                w.getId(), w.getTitle(), w.getStatus(), w.getClipId(), deleteFiles, freed / 1024);
         return freed;
     }
 

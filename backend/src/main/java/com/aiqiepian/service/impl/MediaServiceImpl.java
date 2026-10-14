@@ -20,6 +20,8 @@ import com.aiqiepian.service.SettingsService;
 import com.aiqiepian.service.WorkService;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import lombok.RequiredArgsConstructor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
@@ -34,6 +36,14 @@ import java.util.Set;
 @Service
 @RequiredArgsConstructor
 public class MediaServiceImpl implements MediaService {
+
+    private static final Logger log = LoggerFactory.getLogger(MediaServiceImpl.class);
+
+    /**
+     * 已经进入人工流程的作品状态：这些成片是人挑出来等着发（或在 B 站上已发）的，
+     * 任何"清理/精简"类批量操作都不许碰——一次清理把待发稿抹掉，损失的是已经花掉的人力。
+     */
+    private static final Set<String> IN_HUMAN_FLOW = Set.of("PENDING_REVIEW", "APPROVED", "PUBLISHING", "PUBLISHED");
 
     private final RecordingSessionMapper sessionMapper;
     private final WorkMapper workMapper;
@@ -127,26 +137,31 @@ public class MediaServiceImpl implements MediaService {
             }
             case "recordings" -> {
                 int removed = 0; long freed = 0; int skippedPub = 0;
+                long removedClips = 0, removedWorks = 0;
                 for (Long sid : ids) {
                     RecordingSession s = sessionMapper.selectById(sid);
                     if (s == null) continue;
-                    // 级联：先删该会话下的片段（连带其作品/审核/发布记录，已发布默认受保护）
-                    List<Long> clipIds = new ArrayList<>();
-                    for (Clip c : clipMapper.selectList(Wrappers.<Clip>lambdaQuery().eq(Clip::getSessionId, sid))) {
-                        if (c.getId() != null) clipIds.add(c.getId());
-                    }
-                    if (!clipIds.isEmpty()) {
-                        Map<String, Object> cr = clipService.batchDelete(clipIds, force, true);
-                        freed += num(cr.get("freed_bytes"));
-                        skippedPub += (int) num(cr.get("skipped_published"));
+                    if (force) {
+                        // 显式强制：才连带删除该会话的片段（及其作品/审核/发布记录）并抹掉会话行
+                        List<Long> clipIds = new ArrayList<>();
+                        for (Clip c : clipMapper.selectList(Wrappers.<Clip>lambdaQuery().eq(Clip::getSessionId, sid))) {
+                            if (c.getId() != null) clipIds.add(c.getId());
+                        }
+                        if (!clipIds.isEmpty()) {
+                            Map<String, Object> cr = clipService.batchDelete(clipIds, true, true);
+                            freed += num(cr.get("freed_bytes"));
+                            removedClips += num(cr.get("removed_clips"));
+                            removedWorks += num(cr.get("removed_works"));
+                            skippedPub += (int) num(cr.get("skipped_published"));
+                        }
                     }
                     File f = existing(s.getFilePath());
                     if (f != null) { freed += f.length(); if (!f.delete()) f.deleteOnExit(); }
                     long remaining = clipMapper.selectCount(Wrappers.<Clip>lambdaQuery().eq(Clip::getSessionId, sid));
-                    if (remaining == 0) {
+                    if (force && remaining == 0) {
                         sessionMapper.deleteById(sid);   // 会话及其全部下游记录彻底消失
                     } else {
-                        // 仍有已发布作品依赖：保留会话记录，仅解除原始文件引用
+                        // 默认路径（含 force 但仍有片段留存）：保留会话行与片段，仅解除原始文件引用
                         sessionMapper.update(null, Wrappers.<RecordingSession>lambdaUpdate()
                                 .set(RecordingSession::getFilePath, null)
                                 .set(RecordingSession::getFileSizeBytes, 0L)
@@ -155,6 +170,8 @@ public class MediaServiceImpl implements MediaService {
                     removed++;
                 }
                 out.put("removed", removed); out.put("freed_bytes", freed); out.put("skipped_published", skippedPub);
+                out.put("removed_clips", removedClips); out.put("removed_works", removedWorks);
+                out.put("cascaded", force);
             }
             case "subtitles" -> {
                 String dir = settings.getStr("media_dir", "./media");
@@ -186,11 +203,89 @@ public class MediaServiceImpl implements MediaService {
                 out.put("removed", 0); out.put("freed_bytes", 0L); out.put("skipped_published", 0);
             }
         }
+        // 审计：素材库的批量删除是本项目影响面最大的操作（一次勾选可以连带抹掉整场录像的
+        // 片段与成片），过去删完什么都不留，出问题时完全无法归因。这里把类别、条数、ID 范围、
+        // 是否强制、回收字节全部落 INFO 日志。
+        log.info("审计删除[素材库] 类别={} 勾选={} 项 force={} 影响ID范围={}..{} -> 删除={} 连带片段={} 连带作品={} 跳过已发布={} 回收={}",
+                cat, ids.size(), force, ids.stream().mapToLong(Long::longValue).min().orElse(0),
+                ids.stream().mapToLong(Long::longValue).max().orElse(0),
+                num(out.get("removed")), num(out.get("removed_clips")), num(out.get("removed_works")),
+                num(out.get("skipped_published")), humanBytes(num(out.get("freed_bytes"))));
+        return out;
+    }
+
+    /**
+     * 删除影响预览：把"勾 N 项"实际会连带删除多少片段/作品/会话先算出来给界面看。
+     * 素材库各分类的行看起来都只是"一个文件"，但 recordings 行在 force 下会级联整场下游数据，
+     * 界面不预告就会出现"我只是想清磁盘，结果作品全没了"。
+     */
+    @Override
+    public Map<String, Object> deleteImpact(String category, List<Long> ids) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        int sessions = 0, clips = 0, works = 0, published = 0;
+        long bytes = 0;
+        String cat = category == null ? "" : category;
+        if (ids != null) {
+            switch (cat) {
+                case "recordings" -> {
+                    for (Long sid : ids) {
+                        RecordingSession s = sessionMapper.selectById(sid);
+                        if (s == null) continue;
+                        sessions++;
+                        File f = existing(s.getFilePath());
+                        if (f != null) bytes += f.length();
+                        for (Clip c : clipMapper.selectList(Wrappers.<Clip>lambdaQuery().eq(Clip::getSessionId, sid))) {
+                            clips++;
+                            for (Work w : workMapper.selectList(Wrappers.<Work>lambdaQuery().eq(Work::getClipId, c.getId()))) {
+                                works++;
+                                if ("PUBLISHED".equals(w.getStatus())) published++;
+                            }
+                        }
+                    }
+                }
+                case "clips" -> {
+                    for (Long cid : ids) {
+                        Clip c = clipMapper.selectById(cid);
+                        if (c == null) continue;
+                        clips++;
+                        for (Work w : workMapper.selectList(Wrappers.<Work>lambdaQuery().eq(Work::getClipId, cid))) {
+                            works++;
+                            if ("PUBLISHED".equals(w.getStatus())) published++;
+                        }
+                    }
+                }
+                case "works" -> {
+                    for (Long wid : ids) {
+                        Work w = workMapper.selectById(wid);
+                        if (w == null) continue;
+                        works++;
+                        File f = existing(w.getOutputPath());
+                        if (f != null) bytes += f.length();
+                        if ("PUBLISHED".equals(w.getStatus())) published++;
+                    }
+                }
+                default -> { }
+            }
+        }
+        out.put("category", cat);
+        out.put("sessions", sessions);
+        out.put("clips", clips);
+        out.put("works", works);
+        out.put("published_works", published);
+        out.put("bytes", bytes);
         return out;
     }
 
     private static long num(Object v) {
         return v instanceof Number n ? n.longValue() : 0;
+    }
+
+    /** 日志里的字节数：按量级自适应单位，删 4KB 却显示"回收=0 MB"会让人以为什么都没删 */
+    private static String humanBytes(long b) {
+        if (b < 1024) return b + " B";
+        if (b < 1048576) return String.format("%.1f KB", b / 1024.0);
+        if (b < 1073741824L) return String.format("%.1f MB", b / 1048576.0);
+        return String.format("%.2f GB", b / 1073741824.0);
     }
 
     @Override
@@ -317,7 +412,7 @@ public class MediaServiceImpl implements MediaService {
     @Override
     public Map<String, Object> cleanupRedundant(Integer keepPerSession, boolean deleteFiles, boolean purgeOrphans) {
         int keep = keepPerSession == null || keepPerSession < 1 ? 3 : keepPerSession;
-        int removedClips = 0, removedWorks = 0, skippedPub = 0, orphans = 0;
+        int removedClips = 0, removedWorks = 0, skippedPub = 0, orphans = 0, protectedWorks = 0;
         long freed = 0;
 
         for (RecordingSession s : sessionMapper.selectList(null)) {
@@ -326,14 +421,19 @@ public class MediaServiceImpl implements MediaService {
                     .orderByDesc(Clip::getScore).orderByAsc(Clip::getId));
             for (int i = keep; i < clips.size(); i++) {
                 Clip c = clips.get(i);
+                boolean protectClip = false;
                 for (Work w : workMapper.selectList(Wrappers.<Work>lambdaQuery().eq(Work::getClipId, c.getId()))) {
-                    if ("PUBLISHED".equals(w.getStatus())) { skippedPub++; continue; } // 已发布不动
+                    if ("PUBLISHED".equals(w.getStatus())) { skippedPub++; protectClip = true; continue; } // 已发布不动
+                    // 进入过人工流程（待审片/已批准/上传中/上传失败待重试）的作品都是用户还在用的东西，
+                    // 清理冗余只该动"还没人看过"的草稿，否则一次清理就把人挑好待发的成片抹掉了
+                    if (IN_HUMAN_FLOW.contains(w.getStatus())) { protectedWorks++; protectClip = true; continue; }
                     if (deleteFiles) freed += deleteIfPresent(w.getOutputPath()) + deleteIfPresent(w.getCoverPath());
                     reviewRecordMapper.delete(Wrappers.<ReviewRecord>lambdaQuery().eq(ReviewRecord::getWorkId, w.getId()));
                     publishTaskMapper.delete(Wrappers.<PublishTask>lambdaQuery().eq(PublishTask::getWorkId, w.getId()));
                     workMapper.deleteById(w.getId());
                     removedWorks++;
                 }
+                if (protectClip) continue;   // 有作品被保护 → 片段也留着，别让稿件失去本地来源
                 if (deleteFiles) freed += deleteIfPresent(c.getFilePath());
                 clipMapper.deleteById(c.getId());
                 removedClips++;
@@ -369,9 +469,13 @@ public class MediaServiceImpl implements MediaService {
         m.put("removed_works", removedWorks);
         m.put("removed_orphans", orphans);
         m.put("skipped_published", skippedPub);
+        m.put("protected_works", protectedWorks);
         m.put("freed_bytes", freed);
         m.put("delete_files", deleteFiles);
         m.put("purge_orphans", purgeOrphans);
+        log.info("审计删除[一键清理冗余] 每会话保留={} 删片段={} 删作品={} 保护人工流程中的作品={} 跳过已发布={} " +
+                        "清孤儿文件={} 连文件删除={} 回收={}",
+                keep, removedClips, removedWorks, protectedWorks, skippedPub, orphans, deleteFiles, humanBytes(freed));
         return m;
     }
 

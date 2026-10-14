@@ -13,12 +13,16 @@ public interface MediaService {
 
     /**
      * 素材库按分类批量删除（ids 为该分类行的 ref.id）。
-     * recordings：删原始录制文件并清掉会话的文件路径引用（会话记录保留）；
+     * recordings：默认只删原始录制文件并解除会话的文件引用——会话行、片段、作品一律保留
+     *              （勾选"强制"才级联删除该会话的片段及其未发布作品，并抹掉会话行）；
      * clips / works：走各自的删除语义（级联产物 + 已发布默认拒删）；
      * subtitles / covers：仅删对应字幕 / 封面文件。
-     * @return removed / freed_bytes / skipped_published
+     * @return removed / freed_bytes / skipped_published / removed_clips / removed_works / cascaded
      */
     Map<String, Object> deleteSelected(String category, List<Long> ids, boolean force);
+
+    /** 删除影响预览：勾选这些行实际会连带删除多少会话/片段/作品（含其中已发布的条数）与字节 */
+    Map<String, Object> deleteImpact(String category, List<Long> ids);
 
     Map<String, Object> stats();
 
