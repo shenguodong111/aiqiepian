@@ -32,11 +32,9 @@ import org.springframework.stereotype.Service;
 
 import java.io.File;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -51,8 +49,6 @@ public class PipelineServiceImpl implements PipelineService {
 
     private static final Logger log = LoggerFactory.getLogger(PipelineServiceImpl.class);
 
-    /** 与 mock 的 toLocaleDateString('zh-CN') 等价，如 2026/10/9 */
-    private static final DateTimeFormatter TITLE_DATE = DateTimeFormatter.ofPattern("yyyy/M/d", Locale.CHINA);
 
     /** 发布前（可安全补全标题/简介）的作品状态集合 */
     private static final Set<String> PRE_PUBLISH = Set.of("DRAFT", "RENDERING", "READY", "APPROVED");
@@ -308,11 +304,17 @@ public class PipelineServiceImpl implements PipelineService {
         int topScore = chosen.stream().mapToInt(c -> c.getScore() == null ? 0 : c.getScore()).max().orElse(0);
 
         String roomName = s.getRoomName() != null && !s.getRoomName().isBlank() ? s.getRoomName() : "直播";
+        // 集锦标题同样走三蛆风格（用分数最高的那段做语境）：这里曾经硬编码成
+        // 《主播》2026/10/14 高光集锦 ——书名号+日期正是标题规则里明确禁止的，且完全绕开了 TitleGenerator。
+        Clip best = byScore.get(0);
+        TitleGenerator.Result reelTs = titleGenerator.suggest(best, false);
+        String reelTitle = reelTs.title() != null && !reelTs.title().isBlank()
+                ? reelTs.title() : shortRoomLabel(roomName) + " 高光集锦";
         Work w = new Work();
         w.setClipId(chosen.get(0).getId());
         w.setRoomId(s.getRoomId());
         w.setRoomName(s.getRoomName());
-        w.setTitle("《" + roomName + "》" + todayTitleDate() + " 高光集锦");
+        w.setTitle(reelTitle);
         w.setDescription("");
         w.setTags(resolveTags(s.getRoomId()));
         w.setSubtitleEnabled(false);
@@ -331,8 +333,15 @@ public class PipelineServiceImpl implements PipelineService {
         workMapper.updateById(w);
 
         addJob("RENDER", "work", w.getId());
+        enrichWorkAsync(w.getId(), best.getId()); // 与单片段一致：稍后用本地大模型换成三蛆风格标题并补简介
         log.info("高光集锦作品已创建 work={} 段={} 预计={}s（目标 {}s，录制 {}s）",
                 w.getId(), chosen.size(), acc, target, recorded);
+    }
+
+    /** 房间名做标题保底：剥掉营销尾巴，别把"XX官方直播间"整串塞进标题 */
+    private static String shortRoomLabel(String roomName) {
+        String r = roomName.replaceAll("(官方直播间|官方|录播|回放|直播中|直播间).*$", "").trim();
+        return r.isEmpty() ? "直播" : (r.length() > 8 ? r.substring(0, 8) : r);
     }
 
     private static File existingFile(String path) {
@@ -352,9 +361,11 @@ public class PipelineServiceImpl implements PipelineService {
         w.setRoomName(clip.getRoomName());
         // 即时返回：标题走纯规则（不等本地模型），简介先留空，随后 enrichWorkAsync 用大模型补全
         TitleGenerator.Result ts = titleGenerator.suggest(clip, false);
-        w.setTitle("generic".equals(ts.kind())
-                ? roomName + " " + todayTitleDate() + " 精彩片段 #" + clip.getId()
-                : ts.title());
+        // 纯规则结果（含 generic 回退"主播+决胜时刻名场面"）本身就是三蛆风格保底，
+        // 过去这里又叠了一层"房间名 2026/10/14 精彩片段 #788"——书名号外的日期与编号同样是标题规则禁的东西
+        String instant = ts.title() != null && !ts.title().isBlank()
+                ? ts.title() : shortRoomLabel(roomName) + " 精彩片段";
+        w.setTitle(instant);
         w.setDescription("");
         w.setTags(resolveTags(clip.getRoomId()));
         w.setSubtitleEnabled(true);
@@ -505,10 +516,6 @@ public class PipelineServiceImpl implements PipelineService {
 
     private static String nvl(String v) {
         return v == null ? "" : v;
-    }
-
-    private static String todayTitleDate() {
-        return java.time.LocalDate.now().format(TITLE_DATE);
     }
 
     /** 优先使用房间级发布标签，为空则回退全局默认 */

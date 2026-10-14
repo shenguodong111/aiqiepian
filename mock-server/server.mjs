@@ -129,9 +129,8 @@ function makeWork(clip, auto) {
   const room = db.rooms.find(r => r.id === clip.room_id)
   const st = smartTitle(clip)
   const w = { id: nid(), clip_id: clip.id, room_name: clip.room_name || room?.room_name,
-    title: st.kind === 'generic'
-      ? `${clip.room_name || '直播'} ${new Date().toLocaleDateString('zh-CN')} 精彩片段 #${clip.id}`
-      : st.title,
+    // 标题一律走 smartTitle：过去 generic 时又叠一层"房间名 日期 精彩片段 #id"，日期与编号是标题规则禁止的
+    title: st.title,
     description: '', tags: db.settings.publish_default_tags, cover_path: `${db.settings.media_dir}/covers/work_${seq}_cover.jpg`,
     subtitle_enabled: true, subtitle_style: 'big', aspect_ratio: '9:16',
     status: 'DRAFT', score: clip.score, output_path: null, created_at: now(), updated_at: now() }
@@ -139,6 +138,13 @@ function makeWork(clip, auto) {
   if (!auto) addJob('RENDER', 'work', w.id)
   else addJob('RENDER', 'work', w.id)
   return w
+}
+
+/** 主播精简名（与后端 shortAnchor 同规则） */
+function anchorOf(clip, live) {
+  const src = (clip.anchor_name || live || '').trim()
+  const cleaned = src.replace(/(官方直播间|官方|录播|回放|直播中|房间号|直播间|[:：|｜].*)$/, '').trim().split(' ')[0]
+  return (cleaned || '').slice(0, 8) || '主播'
 }
 
 // FR-P5-05 智能标题（与后端 TitleGenerator 同规则）：比赛=【战队1】VS【战队2】+时刻；日常=主播名+高频弹幕一句话
@@ -162,7 +168,9 @@ function smartTitle(clip) {
     const sentence = words.length === 1 ? `满屏「${words[0]}」` : `弹幕齐刷${words.map(w => `「${w}」`).join('')}`
     return { title: (`${anchor}高能瞬间，${sentence}`).slice(0, 79), kind: 'daily', summary: sentence }
   }
-  return { title: `${live.replace(/[【】\[\]]/g, '').trim().slice(0, 40)} ${new Date().toLocaleDateString('zh-CN')} 精彩片段`, kind: 'generic', summary: '未采集到弹幕统计，使用通用模板' }
+  const hook = (clip.score || 0) >= 90 ? '决胜时刻'
+    : (clip.ai_reason || '').indexOf('场景切换') >= 0 ? '团战' : (clip.score || 0) >= 80 ? '关键一波' : '精彩对决'
+  return { title: `${anchorOf(clip, live)} ${hook}名场面`.slice(0, 79), kind: 'generic', summary: '未采集到弹幕统计，使用通用模板' }
 }
 
 function renderDone(w) {
