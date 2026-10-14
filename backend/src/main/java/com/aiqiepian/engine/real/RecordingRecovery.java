@@ -3,6 +3,7 @@ package com.aiqiepian.engine.real;
 import com.aiqiepian.common.SessionFiles;
 import com.aiqiepian.entity.RecordingSession;
 import com.aiqiepian.mapper.RecordingSessionMapper;
+import com.aiqiepian.service.PipelineService;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
@@ -23,8 +24,9 @@ import java.util.List;
  * DB 里 {@code file_path} 指向的最终文件。进程被强杀（崩溃、被回收、直接关窗口）时这一步永远不会发生，
  * 于是几 GB 素材既播不了也分析不了——对管线彻底隐形。这里在启动时补一次收尾。
  *
- * <p>刻意<b>不</b>自动补跑分析：遗留会话可能有十几个、单个几 GB，开机就串跑 Whisper 会把机器占死。
- * 文件恢复可播后，用户想分析哪条在录制任务页点「重新分析」即可。
+ * <p>遗留分片恢复可播之后，**正在录制中被掐断的那几条会自动接上分析**（文件已经录好了，
+ * 停在"已结束、未分析"就是用户看到的"录完却没走到下一步"）。历史遗留的 FINISHED 行不在此列——
+ * 那可能有十几条几 GB 的旧素材，开机全串跑 Whisper 会把机器占死，想分析哪条在录制任务页点「重新分析」。
  */
 @Component
 @RequiredArgsConstructor
@@ -34,6 +36,7 @@ public class RecordingRecovery implements ApplicationRunner {
     private static final Logger log = LoggerFactory.getLogger(RecordingRecovery.class);
 
     private final RecordingSessionMapper sessionMapper;
+    private final PipelineService pipeline;
 
     @Override
     public void run(ApplicationArguments args) {
@@ -48,7 +51,7 @@ public class RecordingRecovery implements ApplicationRunner {
                 Wrappers.<RecordingSession>lambdaQuery()
                         .in(RecordingSession::getStatus, List.of("RECORDING", "FINISHED"))
                         .orderByAsc(RecordingSession::getId));
-        int merged = 0, closed = 0;
+        int merged = 0, closed = 0, queued = 0;
         for (RecordingSession s : rows) {
             String p = s.getFilePath();
             if (p == null || p.isBlank()) {
@@ -75,13 +78,28 @@ public class RecordingRecovery implements ApplicationRunner {
             if ("RECORDING".equals(s.getStatus())) {
                 s.setStatus("FINISHED");
                 s.setEndedAt(LocalDateTime.now());
+                boolean queueAnalysis = "NONE".equals(nvl(s.getAnalyzeStatus())) || s.getAnalyzeStatus() == null;
+                if (queueAnalysis) s.setAnalyzeStatus("PENDING");
                 sessionMapper.updateById(s);
                 closed++;
+                if (queueAnalysis && pipeline.activeJob("ANALYZE", "session", s.getId()) == null) {
+                    pipeline.addJob("ANALYZE", "session", s.getId());
+                    queued++;
+                    log.info("遗留录制已接上分析队列 session={} 录到 {} 秒", s.getId(), nz(s.getRecordedSec()));
+                }
             }
         }
         if (merged > 0 || closed > 0) {
-            log.info("启动录制收尾完成：合并分片 {} 条，关闭遗留录制中行 {} 条（需要分析请在录制任务点「重新分析」）",
-                    merged, closed);
+            log.info("启动录制收尾完成：合并分片 {} 条，关闭遗留录制中行 {} 条（其中 {} 条已自动排队分析；"
+                    + "更早的历史会话请在录制任务点「重新分析」）", merged, closed, queued);
         }
+    }
+
+    private static String nvl(String v) {
+        return v == null ? "" : v;
+    }
+
+    private static int nz(Integer v) {
+        return v == null ? 0 : v;
     }
 }
