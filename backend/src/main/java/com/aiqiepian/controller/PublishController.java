@@ -46,6 +46,30 @@ public class PublishController {
         return ApiResponse.ok(publishService.bind(BodyUtils.str(body, "nickname", null)));
     }
 
+    /** 扫码登录第一步：取二维码（image 为 PNG data URL，界面直接显示） */
+    @PostMapping("/account/qrcode")
+    public ApiResponse<Map<String, Object>> qrcodeStart() {
+        return ApiResponse.ok(publishService.qrcodeStart());
+    }
+
+    /** 扫码登录第二步：轮询；status=confirmed 时后端已自动写入 Cookie 并绑定账号 */
+    @GetMapping("/account/qrcode/poll")
+    public ApiResponse<Map<String, Object>> qrcodePoll(@RequestParam String key) {
+        return ApiResponse.ok(publishService.qrcodePoll(key));
+    }
+
+    /** 用现有 Cookie 尝试续期（免重新登录） */
+    @PostMapping("/account/refresh")
+    public ApiResponse<Map<String, Object>> refreshCookie() {
+        return ApiResponse.ok(publishService.refreshCookie());
+    }
+
+    /** Cookie 体检状态（设置页徽标 / 发布中心红条用） */
+    @GetMapping("/account/status")
+    public ApiResponse<Map<String, Object>> cookieStatus() {
+        return ApiResponse.ok(publishService.cookieStatus());
+    }
+
     @DeleteMapping("/account")
     public ApiResponse<Boolean> unbind() {
         publishService.unbind();

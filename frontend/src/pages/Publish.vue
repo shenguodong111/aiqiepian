@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { http } from '../api/http'
 import { toast } from '../utils/toast'
 import { patchSettings, store } from '../stores/app'
@@ -11,6 +11,7 @@ import { PUBLISH_STATUS, PLATFORMS, fmtTime } from '../utils/format'
 
 const account = ref(null)
 const accountLoaded = ref(false)
+const cookieStatus = ref(null)
 const bindModal = ref(false)
 const bindNickname = ref('')
 
@@ -30,7 +31,13 @@ async function loadAccount() {
   try {
     account.value = await http.get('/publish/account', null, { silent: true })
   } catch { /* 忽略 */ } finally { accountLoaded.value = true }
+  try {
+    cookieStatus.value = await http.get('/publish/account/status', null, { silent: true })
+  } catch { /* 忽略 */ }
 }
+
+// 登录态掉了的话，发布只会一条条失败——在这里直接说清原因并给去处，而不是让人猜
+const cookieDead = computed(() => ['EXPIRED', 'MISSING'].includes(cookieStatus.value?.status))
 
 async function load(silent = false) {
   try {
@@ -149,6 +156,12 @@ onUnmounted(() => clearInterval(timer))
 
 <template>
   <div class="publish-page">
+    <!-- 登录态掉了只会让每条发布都失败，先把原因和入口摆在这里 -->
+    <div v-if="cookieDead" class="card cookie-dead">
+      <b>B 站登录态{{ cookieStatus.status === 'MISSING' ? '未配置' : '已失效' }}</b>
+      <span class="hint">—— {{ cookieStatus.message || '发布会被判为 -101 账号未登录' }}。</span>
+      <router-link class="btn primary" style="margin-left:auto" to="/settings">去设置页扫码登录</router-link>
+    </div>
     <!-- FR-P7-01 账号区 + FR-P7-03 自动发布 -->
     <div class="card acct-card">
       <div class="acct-left">
@@ -279,6 +292,7 @@ onUnmounted(() => clearInterval(timer))
 
 <style scoped>
 .publish-page { display: flex; flex-direction: column; }
+.cookie-dead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 18px; margin-bottom: 12px; border-left: 3px solid #ef5b5b; }
 .acct-card { padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
 .acct-left { display: flex; flex-direction: column; gap: 10px; min-width: 260px; }
 .acct-bound { display: flex; align-items: center; gap: 12px; }

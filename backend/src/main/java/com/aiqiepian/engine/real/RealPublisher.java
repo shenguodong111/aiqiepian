@@ -116,14 +116,16 @@ public class RealPublisher implements Publisher {
 
             // ---- 前置检查 1：Cookie 三件套 ----
             if (!bili.cookiesComplete()) {
+                markCookieStatus("MISSING", "未配置 B 站 Cookie，请在设置页扫码登录");
                 throw new BiliApiException(-101,
-                        "未配置 B 站 Cookie：请在设置页填写 bili_sessdata / bili_jct / bili_uid（当前缺失）");
+                        "未配置 B 站 Cookie：请在设置页点「扫码登录」（当前缺失 bili_sessdata / bili_jct / bili_uid）");
             }
             // ---- 前置检查 2：nav() 登录校验 ----
             NavInfo nav = bili.nav();
             if (!nav.login()) {
+                markCookieStatus("EXPIRED", "B站判定未登录（" + nav.code() + "）：" + nav.message());
                 throw new BiliApiException(nav.code(),
-                        "Cookie 无效或已过期（B站判定未登录）: " + nav.message());
+                        "Cookie 无效或已过期（B站判定未登录）: " + nav.message() + " —— 请到设置页扫码重新登录");
             }
             long mid = nav.mid() != null ? nav.mid()
                     : parseLongOrThrow(settings.getStr("bili_uid", ""));
@@ -198,6 +200,16 @@ public class RealPublisher implements Publisher {
                 .set(PublishTask::getProgress, 1)
                 .set(PublishTask::getErrorMsg, null)
                 .eq(PublishTask::getId, taskId));
+    }
+
+    /**
+     * 发布现场发现的登录态问题立刻写回设置，界面（设置页徽标 / 发布中心红条）当场就能看到，
+     * 不用等下一次定时体检——用户遇到的"发布失败但不知道是 Cookie 掉了"就是这一段。
+     */
+    private void markCookieStatus(String status, String message) {
+        settings.setValue("bili_cookie_status", status);
+        settings.setValue("bili_cookie_checked_at", java.time.LocalDateTime.now().toString());
+        settings.setValue("bili_cookie_message", message);
     }
 
     private void updateProgress(long taskId, int progress) {

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { http } from '../api/http'
 import { toast } from '../utils/toast'
 import { store, loadSettings } from '../stores/app'
@@ -160,7 +160,60 @@ async function doImport() {
   } catch { /* http 已 toast */ } finally { importing.value = false }
 }
 
-onMounted(load)
+// ---------- B 站登录态：扫码登录 / 自动续期 ----------
+const cookieStatus = ref(null)
+const qr = reactive({ open: false, image: '', key: '', url: '', status: '', message: '' })
+let qrTimer = null
+
+const COOKIE_TEXT = { VALID: '登录态有效', EXPIRED: '已过期·需重新扫码', MISSING: '未配置', UNKNOWN: '未体检', MOCK: '模拟引擎' }
+function cookieText(s) { return COOKIE_TEXT[s?.status || 'UNKNOWN'] || '未体检' }
+
+async function loadCookieStatus() {
+  try { cookieStatus.value = await http.get('/publish/account/status', null, { silent: true }) } catch { /* 状态拉不到不影响设置页其它功能 */ }
+}
+
+async function startQrLogin() {
+  stopQrPoll()
+  const r = await http.post('/publish/account/qrcode', {})
+  if (!r || !r.ok) { toast.error((r && r.message) || '当前引擎不支持扫码登录'); return }
+  qr.open = true
+  qr.image = r.image
+  qr.key = r.qrcode_key
+  qr.url = r.url
+  qr.status = 'waiting'
+  qr.message = '请用哔哩哔哩手机 App 扫下面的二维码'
+  qrTimer = setInterval(pollQr, 2000)
+}
+
+async function pollQr() {
+  if (!qr.key) return
+  const r = await http.get('/publish/account/qrcode/poll', { key: qr.key }, { silent: true })
+  if (!r) return
+  qr.status = r.status
+  qr.message = r.message || ''
+  if (r.status === 'confirmed') {
+    stopQrPoll()
+    qr.open = false
+    toast.success(`已登录「${r.nickname || 'B站账号'}」，Cookie 已自动存到本机`)
+    await Promise.all([loadCookieStatus(), load()])
+  } else if (r.status === 'expired' || r.status === 'canceled') {
+    stopQrPoll()
+  }
+}
+
+function stopQrPoll() {
+  if (qrTimer) { clearInterval(qrTimer); qrTimer = null }
+}
+
+async function refreshCookie() {
+  const r = await http.post('/publish/account/refresh', {})
+  if (r && r.ok) toast.success(r.message || '已续期')
+  else toast.error((r && r.message) || '续期失败，请扫码重新登录')
+  await loadCookieStatus()
+}
+
+onMounted(() => { load(); loadCookieStatus() })
+onUnmounted(stopQrPoll)
 </script>
 
 <template>
@@ -272,8 +325,23 @@ onMounted(load)
           <div class="group-title">发布</div>
           <label class="field"><span>默认标签（逗号分隔）</span><input class="input" v-model="form.publish_default_tags" placeholder="直播切片,AI剪辑" /></label>
           <label class="field"><span>投稿分区 ID（tid）</span><input class="input" type="number" v-model.number="form.publish_tid" placeholder="244" /></label>
-          <div class="hint" style="margin: 10px 0 6px">Bilibili 上传凭证（real 模式必填；浏览器 F12 → Application → Cookies 复制，仅存本机）</div>
-          <label class="field"><span>SESSDATA</span><input class="input" v-model="form.bili_sessdata" placeholder="登录后自动掩码显示，重新粘贴可覆盖" /></label>
+          <div class="bili-auth">
+            <div class="bili-auth-row">
+              <span class="hint">B 站登录态</span>
+              <span :class="['cookie-badge', (cookieStatus?.status || 'UNKNOWN').toLowerCase()]">{{ cookieText(cookieStatus) }}</span>
+              <span class="hint num" v-if="cookieStatus?.checked_at">{{ String(cookieStatus.checked_at).slice(0, 16).replace('T', ' ') }} 体检</span>
+            </div>
+            <div class="hint" v-if="cookieStatus?.message">{{ cookieStatus.message }}</div>
+            <div class="bili-auth-actions">
+              <button class="btn primary" @click="startQrLogin">扫码登录</button>
+              <button class="btn" @click="refreshCookie">尝试续期</button>
+            </div>
+            <div class="hint" style="margin-bottom: 8px">
+              扫码即可，不用再去 F12 复制 Cookie。程序每 30 分钟自动体检，登录态能续就自己续；
+              只有被 B 站强制作废（改密码 / 异地登录 / 风控）才需要重新扫一次码。下面三件套留作备用手工入口。
+            </div>
+          </div>
+          <label class="field"><span>SESSDATA</span><input class="input" v-model="form.bili_sessdata" placeholder="扫码登录后自动写入并掩码显示，重新粘贴可覆盖" /></label>
           <label class="field"><span>bili_jct（csrf）</span><input class="input" v-model="form.bili_jct" /></label>
           <label class="field"><span>DedeUserID</span><input class="input" v-model="form.bili_uid" /></label>
           <div class="hint" style="margin: 8px 0 4px">（可选·弹幕采集需要）完整浏览器 Cookie：在 live.bilibili.com 按 F12 → 网络 → 任意 api.live.bilibili.com 请求 → 复制请求头里完整的 Cookie 粘贴到此</div>
@@ -370,11 +438,32 @@ onMounted(load)
         <button v-if="!cleanResult" class="btn danger" :disabled="cleaning" @click="doCleanRedundant">{{ cleaning ? '清理中…' : '开始清理' }}</button>
       </div>
     </Modal>
+    <Modal v-if="qr.open" title="扫码登录 B 站" @close="qr.open = false; stopQrPoll()">
+      <div class="qr-box">
+        <img v-if="qr.image" :src="qr.image" alt="B站登录二维码" class="qr-img" />
+        <p v-else class="hint">二维码图片生成失败，可复制此链接在手机里打开登录：<span class="num">{{ qr.url }}</span></p>
+        <div class="qr-status">{{ qr.message }}</div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn ghost" @click="qr.open = false; stopQrPoll()">关闭</button>
+        <button v-if="qr.status === 'expired' || qr.status === 'canceled'" class="btn primary" @click="startQrLogin">重新获取二维码</button>
+      </div>
+    </Modal>
   </div>
 </template>
 
 <style scoped>
 .settings-page { display: flex; flex-direction: column; gap: 16px; }
+.bili-auth { margin: 12px 0 10px; padding: 10px 12px; border: 1px solid var(--line, #2a2f3a); border-radius: 8px; }
+.bili-auth-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+.bili-auth-actions { display: flex; gap: 8px; margin: 8px 0; }
+.cookie-badge { font-size: 12px; font-weight: 700; padding: 2px 9px; border-radius: 999px; background: #333a47; color: #cfd6e4; }
+.cookie-badge.valid { background: rgba(52, 199, 123, .16); color: #4ade80; }
+.cookie-badge.expired { background: rgba(239, 91, 91, .16); color: #f87171; }
+.cookie-badge.missing { background: rgba(245, 179, 66, .16); color: #fbbf24; }
+.qr-box { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 6px 0 2px; }
+.qr-img { width: 240px; height: 240px; image-rendering: pixelated; background: #fff; border-radius: 8px; padding: 6px; }
+.qr-status { font-size: 13px; color: var(--text-dim, #9aa4b2); }
 .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 16px; align-items: start; }
 .group { padding: 18px 22px; }
 .group-title { font-size: 14px; font-weight: 700; margin-bottom: 14px; display: flex; align-items: center; }

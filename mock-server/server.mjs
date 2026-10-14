@@ -466,6 +466,13 @@ const server = http.createServer(async (req, res) => {
   if (api === '/publish/account' && req.method === 'GET') return ok(res, db.account)
   if (api === '/publish/account/bind' && req.method === 'POST') { db.account = { platform: 'bilibili', nickname: body.nickname || 'AI切片演示号', bound_at: now() }; return ok(res, db.account) }
   if (api === '/publish/account' && req.method === 'DELETE') { db.account = null; return ok(res, true) }
+  // 扫码登录/续期是 B 站真实协议，模拟引擎一律明确回 unsupported（界面据此不显示红条、不轮询）
+  if (api === '/publish/account/status' && req.method === 'GET') {
+    return ok(res, { status: 'MOCK', checked_at: '', message: '模拟引擎不需要 B 站登录态', nickname: db.account?.nickname || null, configured: false, qrcode_enabled: false })
+  }
+  if (api === '/publish/account/qrcode' && req.method === 'POST') return ok(res, { ok: false, message: '当前引擎非 real（模拟引擎不需要 B 站登录态）' })
+  if (api === '/publish/account/qrcode/poll' && req.method === 'GET') return ok(res, { status: 'unsupported', message: '当前引擎非 real' })
+  if (api === '/publish/account/refresh' && req.method === 'POST') return ok(res, { ok: false, message: '当前引擎非 real' })
   if (api === '/publish/tasks' && req.method === 'GET') {
     let list = [...db.publishes].reverse()
     if (q.status) list = list.filter(p => p.status === q.status)

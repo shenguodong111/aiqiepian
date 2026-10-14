@@ -124,6 +124,200 @@ public class BiliClient {
         return s.length() <= 200 ? s : s.substring(0, 200) + "...(截断)";
     }
 
+    // ---------- 扫码登录 / Cookie 续期 ----------
+
+    public static final String QR_GENERATE_URL =
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/generate?source=main-fe-header";
+    public static final String QR_POLL_URL =
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/poll?source=main-fe-header&qrcode_key=";
+    /** B站网页端自己就在周期调用它来滚动续期登录态；会话未被强制作废时能一直续下去 */
+    public static final String COOKIE_REFRESH_URL = "https://passport.bilibili.com/x/passport-login/web/cookie/refresh";
+
+    /** 一次扫码会话：key + 待扫 URL + 已画好的 PNG 二维码（data URL，界面直接当 img src 用） */
+    public record QrLogin(String qrcodeKey, String url, String imagePng) {
+    }
+
+    /** 轮询状态：waiting | scanned | confirmed | canceled | expired */
+    public record QrPoll(String status, String message, Map<String, String> cookies) {
+    }
+
+    /** 站点首页语境头（passport 接口按浏览器语境校验 Referer/Origin） */
+    private HttpHeaders browserHeaders(MediaType contentType, boolean withCookie) {
+        HttpHeaders h = new HttpHeaders();
+        if (contentType != null) h.setContentType(contentType);
+        h.set(HttpHeaders.USER_AGENT, UA);
+        h.set(HttpHeaders.REFERER, "https://www.bilibili.com/");
+        h.set(HttpHeaders.ORIGIN, "https://www.bilibili.com");
+        String full = settings.getStr("bili_browser_cookie", "");
+        if (withCookie && !full.isBlank()) h.set(HttpHeaders.COOKIE, full.trim());
+        return h;
+    }
+
+    /** 申请扫码登录二维码 */
+    public QrLogin qrcodeGenerate() {
+        JsonNode j = getJson(QR_GENERATE_URL, browserHeaders(null, false));
+        int code = j.path("code").asInt(-999);
+        if (code != 0) {
+            throw new BiliApiException(code, "二维码获取失败：" + j.path("message").asText(""));
+        }
+        String url = j.path("data").path("url").asText("");
+        String key = j.path("data").path("qrcode_key").asText("");
+        if (url.isBlank() || key.isBlank()) throw new BiliApiException(-1, "二维码响应缺少 url/qrcode_key");
+        return new QrLogin(key, url, qrPngDataUrl(url));
+    }
+
+    /**
+     * 轮询扫码状态。成功时 B站把登录 Cookie 放在**响应头** Set-Cookie 里（body 只有跳转 url），
+     * 所以这里必须拿到原始响应头，不能只走 getJson。
+     *
+     * <p>坑（2026-10-14 实测）：这个接口的**外层 code 恒为 0**，真正的状态在 {@code data.code} 里
+     * （未扫码=86101、已扫码待确认=86090、成功=0 且 data.url 非空）。按外层 code 判断会把"等待扫码"
+     * 直接当成登录成功——于是提示"扫码成功但没有 Cookie"，永远扫不完。
+     */
+    public QrPoll qrcodePoll(String qrcodeKey) {
+        String url = QR_POLL_URL + urlEncode(qrcodeKey);
+        ResponseEntity<String> resp;
+        try {
+            resp = rest.exchange(java.net.URI.create(url), HttpMethod.GET,
+                    new HttpEntity<>(browserHeaders(null, false)), String.class);
+        } catch (RestClientException e) {
+            return new QrPoll("expired", "轮询失败：" + truncate(e.getMessage()), Map.of());
+        }
+        JsonNode outer;
+        try {
+            outer = mapper.readTree(resp.getBody() == null ? "{}" : resp.getBody());
+        } catch (Exception e) {
+            return new QrPoll("expired", "轮询响应不是 JSON：" + truncate(resp.getBody()), Map.of());
+        }
+        if (outer.path("code").asInt(-999) != 0) {
+            return new QrPoll("expired", "轮询被拒绝：" + outer.path("message").asText(""), Map.of());
+        }
+        JsonNode data = outer.path("data");
+        int st = data.path("code").asInt(-1);
+        String jump = data.path("url").asText("");
+        String innerMsg = data.path("message").asText("");
+        if (st == 0 && !jump.isBlank()) {
+            Map<String, String> ck = cookiesOf(resp.getHeaders());
+            if (!ck.containsKey("SESSDATA") || !ck.containsKey("bili_jct") || !ck.containsKey("DedeUserID")) {
+                return new QrPoll("expired", "扫码确认成功，但响应里没有登录 Cookie（可能被风控拦下）", ck);
+            }
+            return new QrPoll("confirmed", innerMsg, ck);
+        }
+        if (st == 0) return new QrPoll("waiting", "请在手机上确认", Map.of());
+        return switch (st) {
+            case 86101 -> new QrPoll("waiting", "等待扫码：请用哔哩哔哩手机 App 扫这个码", Map.of());
+            case 86090 -> new QrPoll("scanned", "已扫码，请在手机上点「确认登录」", Map.of());
+            case 86097 -> new QrPoll("canceled", "已在手机上取消本次登录，可重新获取二维码", Map.of());
+            case 86096 -> new QrPoll("expired", "二维码已过期，请重新获取", Map.of());
+            case 86038 -> new QrPoll("expired", "该二维码已不可用，请重新获取", Map.of());
+            default -> new QrPoll("expired",
+                    innerMsg.isEmpty() ? "未知状态 data.code=" + st : innerMsg, Map.of());
+        };
+    }
+
+    /**
+     * 用当前 Cookie 续期。返回轮换下来的 Cookie（可能只含部分字段）；
+     * 失败（会话已被服务端作废 → -101）返回空 Map，调用方据此提示重新扫码。
+     */
+    public Map<String, String> refreshCookies() {
+        if (!cookiesComplete()) return Map.of();
+        String url = COOKIE_REFRESH_URL + "?csrf=" + urlEncode(jct());
+        try {
+            ResponseEntity<String> resp = rest.exchange(java.net.URI.create(url), HttpMethod.POST,
+                    new HttpEntity<>("", browserHeaders(MediaType.APPLICATION_FORM_URLENCODED, true)), String.class);
+            JsonNode j = mapper.readTree(resp.getBody() == null ? "{}" : resp.getBody());
+            if (j.path("code").asInt(-999) != 0) {
+                log.info("B站 Cookie 续期未通过: code={} message={}", j.path("code").asInt(), j.path("message").asText(""));
+                return Map.of();
+            }
+            Map<String, String> ck = cookiesOf(resp.getHeaders());
+            if (!ck.containsKey("SESSDATA")) {
+                log.info("B站 Cookie 续期响应未携带新 SESSDATA，按未变更处理");
+                return Map.of();
+            }
+            return ck;
+        } catch (RestClientException | java.io.IOException e) {
+            log.info("B站 Cookie 续期请求失败: {}", truncate(e.getMessage()));
+            return Map.of();
+        }
+    }
+
+    /** 从响应的 Set-Cookie 头里挑出登录相关的 Cookie（值不做日志输出） */
+    private static Map<String, String> cookiesOf(HttpHeaders h) {
+        Map<String, String> out = new LinkedHashMap<>();
+        for (String line : h.getOrEmpty(HttpHeaders.SET_COOKIE)) {
+            int semi = line.indexOf(';');
+            String pair = semi < 0 ? line : line.substring(0, semi);
+            int eq = pair.indexOf('=');
+            if (eq <= 0) continue;
+            String k = pair.substring(0, eq).trim();
+            String v = pair.substring(eq + 1).trim();
+            if (v.isEmpty() || "deleted".equalsIgnoreCase(v) || "0".equals(v)) continue;
+            switch (k) {
+                case "SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5", "sid", "buvid3", "bili_ticket" ->
+                        out.put(k, v);
+                default -> {
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 登录/续期拿到的 Cookie 落库。
+     *
+     * <p>完整浏览器 Cookie 采取**合并覆盖**而不是整串重建：扫码登录只回吐 SESSDATA/bili_jct/DedeUserID
+     * 这几个键，若直接用它覆盖，用户先前粘贴的 buvid3/b_nut 等浏览器指纹就被冲掉，
+     * 弹幕采集会重新被 -352 风控拦下（那是单独花力气打通的能力，不能被登录流程顺手破坏）。
+     * 日志只输出掩码值。
+     */
+    public void applyLoginCookies(Map<String, String> ck) {
+        if (ck == null || ck.isEmpty()) return;
+        putIfPresent(ck, "SESSDATA", "bili_sessdata");
+        putIfPresent(ck, "bili_jct", "bili_jct");
+        putIfPresent(ck, "DedeUserID", "bili_uid");
+        String merged = mergeIntoCookie(settings.getStr("bili_browser_cookie", ""), ck);
+        if (!merged.isBlank()) settings.setValue("bili_browser_cookie", merged);
+        log.info("B站 Cookie 已更新: uid={} sessdata={} jct={} 完整Cookie键数={}",
+                mask(uid()), mask(sessdata()), mask(jct()), merged.split(";").length);
+    }
+
+    /** 把新 Cookie 合并进既有完整 Cookie：同名覆盖，其余（buvid3/b_nut/sid…）原样保留 */
+    static String mergeIntoCookie(String existing, Map<String, String> fresh) {
+        LinkedHashMap<String, String> map = new LinkedHashMap<>();
+        for (String part : (existing == null ? "" : existing).split(";")) {
+            String p = part.trim();
+            int eq = p.indexOf('=');
+            if (eq > 0) map.put(p.substring(0, eq), p.substring(eq + 1));
+        }
+        fresh.forEach((k, v) -> {
+            if (v != null && !v.isBlank()) map.put(k, v);
+        });
+        StringBuilder sb = new StringBuilder();
+        map.forEach((k, v) -> sb.append(k).append('=').append(v).append("; "));
+        return sb.toString().trim();
+    }
+
+    private void putIfPresent(Map<String, String> ck, String cookieKey, String settingKey) {
+        String v = ck.get(cookieKey);
+        if (v != null && !v.isBlank()) settings.setValue(settingKey, v);
+    }
+
+    /** 把登录 URL 画成二维码 PNG（data URL）。失败返回空串，界面退回显示链接文本 */
+    private static String qrPngDataUrl(String text) {
+        try {
+            com.google.zxing.common.BitMatrix m = new com.google.zxing.qrcode.QRCodeWriter()
+                    .encode(text, com.google.zxing.BarcodeFormat.QR_CODE, 320, 320,
+                            java.util.Map.of(com.google.zxing.EncodeHintType.MARGIN, 1));
+            java.io.ByteArrayOutputStream png = new java.io.ByteArrayOutputStream();
+            com.google.zxing.client.j2se.MatrixToImageWriter.writeToStream(m, "png", png);
+            return "data:image/png;base64," + java.util.Base64.getEncoder().encodeToString(png.toByteArray());
+        } catch (Exception e) {
+            log.warn("二维码图片生成失败（可退回粘贴链接）: {}", e.toString());
+            return "";
+        }
+    }
+
     // ---------- 1. nav 校验 ----------
 
     /** GET member nav：code==0 且 data.isLogin==true 视为 Cookie 有效 */

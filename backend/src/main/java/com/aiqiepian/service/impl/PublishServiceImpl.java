@@ -98,11 +98,19 @@ public class PublishServiceImpl implements PublishService {
         }
         if (!bili.cookiesComplete()) {
             r.put("login", false);
-            r.put("message", "未配置 bili_sessdata / bili_jct / bili_uid，请先在设置页填写 Cookie 三件套");
+            r.put("message", "未配置 bili_sessdata / bili_jct / bili_uid，请直接扫码登录");
+            markCookieStatus("MISSING", "未配置 Cookie 三件套");
             return r;
         }
         try {
             NavInfo n = bili.nav();
+            if (!n.login()) {
+                // 校验不通过先试一次续期：B站网页端也在周期调同一个接口，能续上就不用用户重新登录
+                if (!refreshCookie().get("ok").equals(true)) {
+                    markCookieStatus("EXPIRED", "Cookie 无效：" + n.message());
+                }
+                n = bili.nav();
+            }
             r.put("login", n.login());
             r.put("code", n.code());
             r.put("uname", n.uname());
@@ -111,6 +119,7 @@ public class PublishServiceImpl implements PublishService {
                 // 校验通过即持久化绑定：使 publish 的账号门(getAccount!=null)通过，且重启/刷新后不再丢绑定态
                 r.put("account", bind(n.uname()));
                 r.put("message", "Cookie 有效");
+                markCookieStatus("VALID", "Cookie 有效：" + n.uname());
             } else {
                 r.put("message", "未登录/Cookie 无效：" + n.message());
             }
@@ -118,8 +127,162 @@ public class PublishServiceImpl implements PublishService {
             r.put("login", false);
             r.put("code", e.getCode());
             r.put("message", e.getBiliMessage());
+            markCookieStatus(e.getCode() == -101 ? "EXPIRED" : "UNKNOWN", "校验异常：" + e.getBiliMessage());
         }
         return r;
+    }
+
+    @Override
+    public Map<String, Object> qrcodeStart() {
+        Map<String, Object> r = new LinkedHashMap<>();
+        BiliClient bili = biliClient.getIfAvailable();
+        if (!"real".equalsIgnoreCase(engineMode) || bili == null) {
+            r.put("ok", false);
+            r.put("message", "当前引擎非 real（模拟引擎不需要 B 站登录态）");
+            return r;
+        }
+        BiliClient.QrLogin q = bili.qrcodeGenerate();
+        r.put("ok", true);
+        r.put("qrcode_key", q.qrcodeKey());
+        r.put("image", q.imagePng());
+        r.put("url", q.url());
+        r.put("expire_sec", 180);
+        return r;
+    }
+
+    @Override
+    public Map<String, Object> qrcodePoll(String qrcodeKey) {
+        Map<String, Object> r = new LinkedHashMap<>();
+        BiliClient bili = biliClient.getIfAvailable();
+        if (!"real".equalsIgnoreCase(engineMode) || bili == null) {
+            r.put("status", "unsupported");
+            r.put("message", "当前引擎非 real");
+            return r;
+        }
+        if (qrcodeKey == null || qrcodeKey.isBlank()) {
+            r.put("status", "expired");
+            r.put("message", "缺少 qrcode_key");
+            return r;
+        }
+        BiliClient.QrPoll p = bili.qrcodePoll(qrcodeKey);
+        r.put("status", p.status());
+        r.put("message", p.message());
+        if (!"confirmed".equals(p.status())) return r;
+
+        bili.applyLoginCookies(p.cookies());
+        try {
+            NavInfo n = bili.nav();
+            if (n.login()) {
+                r.put("account", bind(n.uname()));
+                r.put("nickname", n.uname());
+                r.put("mid", n.mid());
+                markCookieStatus("VALID", "扫码登录成功：" + n.uname());
+                log.info("扫码登录成功，Cookie 已自动保存并绑定账号 uid={}（无需再手工填写三件套）", n.mid());
+            } else {
+                markCookieStatus("EXPIRED", "扫码后 nav 仍未登录：" + n.message());
+                r.put("message", "扫码成功但账号校验未通过：" + n.message());
+            }
+        } catch (BiliApiException e) {
+            markCookieStatus("UNKNOWN", "扫码后校验异常：" + e.getBiliMessage());
+            r.put("message", "扫码成功但校验异常：" + e.getBiliMessage());
+        }
+        return r;
+    }
+
+    @Override
+    public Map<String, Object> refreshCookie() {
+        Map<String, Object> r = new LinkedHashMap<>();
+        BiliClient bili = biliClient.getIfAvailable();
+        if (!"real".equalsIgnoreCase(engineMode) || bili == null) {
+            r.put("ok", false);
+            r.put("message", "当前引擎非 real");
+            return r;
+        }
+        if (!bili.cookiesComplete()) {
+            markCookieStatus("MISSING", "未配置 Cookie 三件套");
+            r.put("ok", false);
+            r.put("message", "尚未配置 Cookie，请直接扫码登录");
+            return r;
+        }
+        Map<String, String> ck = bili.refreshCookies();
+        if (ck.isEmpty()) {
+            markCookieStatus("EXPIRED", "续期未通过（会话已被 B 站作废）");
+            r.put("ok", false);
+            r.put("message", "续期失败：本次登录已被 B 站作废，请扫码重新登录");
+            return r;
+        }
+        bili.applyLoginCookies(ck);
+        r.put("ok", true);
+        try {
+            NavInfo n = bili.nav();
+            if (n.login()) {
+                bind(n.uname());
+                markCookieStatus("VALID", "已续期：" + n.uname());
+                r.put("message", "已续期，登录态有效");
+                r.put("nickname", n.uname());
+            } else {
+                markCookieStatus("EXPIRED", "续期后仍未登录");
+                r.put("message", "续期后账号校验仍未通过，请扫码重新登录");
+            }
+        } catch (BiliApiException e) {
+            r.put("message", "续期已写入但校验异常：" + e.getBiliMessage());
+        }
+        return r;
+    }
+
+    @Override
+    public Map<String, Object> cookieStatus() {
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("status", settings.getStr("bili_cookie_status", "UNKNOWN"));
+        r.put("checked_at", settings.getStr("bili_cookie_checked_at", ""));
+        r.put("message", settings.getStr("bili_cookie_message", ""));
+        PublishAccount acc = getAccount();
+        r.put("nickname", acc == null ? null : acc.getNickname());
+        BiliClient bili = biliClient.getIfAvailable();
+        r.put("configured", "real".equalsIgnoreCase(engineMode) && bili != null && bili.cookiesComplete());
+        r.put("qrcode_enabled", "real".equalsIgnoreCase(engineMode) && bili != null);
+        return r;
+    }
+
+    /** 把 Cookie 体检结论落库，供界面（设置页徽标 / 发布中心红条）直接读取 */
+    private void markCookieStatus(String status, String message) {
+        settings.setValue("bili_cookie_status", status);
+        settings.setValue("bili_cookie_checked_at", LocalDateTime.now().toString());
+        settings.setValue("bili_cookie_message", message == null ? "" : message);
+    }
+
+    /**
+     * 每 30 分钟体检一次登录态：先 nav，失效就试着自己续期（B站网页端也在周期调同一个接口），
+     * 续不动才标成 EXPIRED 提示扫码。这样"会话自然滚到期"这一类不再需要人工干预，
+     * 只有被服务端强制作废（改密码/异地登录/风控）才必须重新扫码。
+     */
+    @Scheduled(fixedDelay = 30 * 60 * 1000L, initialDelay = 45 * 1000L)
+    public void keepCookieAlive() {
+        BiliClient bili = biliClient.getIfAvailable();
+        if (!"real".equalsIgnoreCase(engineMode) || bili == null) {
+            return;
+        }
+        if (!bili.cookiesComplete()) {
+            markCookieStatus("MISSING", "未配置 Cookie 三件套，请扫码登录");
+            return;
+        }
+        try {
+            NavInfo n = bili.nav();
+            if (n.login()) {
+                if (!"VALID".equals(settings.getStr("bili_cookie_status", ""))) {
+                    log.info("B站登录态恢复正常：{}", n.uname());
+                }
+                bind(n.uname());
+                markCookieStatus("VALID", "Cookie 有效：" + n.uname());
+                return;
+            }
+        } catch (BiliApiException e) {
+            log.info("B站登录态校验异常，尝试续期: {}", e.getBiliMessage());
+        }
+        Map<String, Object> r = refreshCookie();
+        if (!Boolean.TRUE.equals(r.get("ok"))) {
+            log.warn("B站 Cookie 已失效且续期未通过，需要重新扫码登录：{}", r.get("message"));
+        }
     }
 
     @Override
