@@ -65,6 +65,12 @@ public class PublishServiceImpl implements PublishService {
     private final Map<Long, Long> reviewSince = new ConcurrentHashMap<>();
     /** 上次对某 task 调 view 回读的时间 */
     private final Map<Long, Long> lastViewPoll = new ConcurrentHashMap<>();
+    /**
+     * taskId → 已自动回队重传次数。只用于"上传阶段被网络抖动打断"（此刻远端还没有稿件，重传不会重复投稿）；
+     * 超过 {@link #NETWORK_RETRY_MAX} 才落 FAILED，交人工。进程重启会清零，但重启本身也会让在传的稿件重新排队。
+     */
+    private final Map<Long, Integer> networkRetries = new ConcurrentHashMap<>();
+    private static final int NETWORK_RETRY_MAX = 2;
 
     @Override
     public PublishAccount getAccount() {
@@ -304,6 +310,7 @@ public class PublishServiceImpl implements PublishService {
         taskMapper.updateById(p);
         realEnqueued.remove(id);
         realProgress.remove(id);
+        networkRetries.remove(id); // 人工重试重新给满自动重传预算
         return p;
     }
 
@@ -345,6 +352,7 @@ public class PublishServiceImpl implements PublishService {
                 realEnqueued.remove(id);
                 realProgress.remove(id);
                 reviewSince.remove(id);
+                networkRetries.remove(id);
                 continue;
             }
             switch (status) {
@@ -391,6 +399,11 @@ public class PublishServiceImpl implements PublishService {
             } catch (Throwable e) {
                 String msg = e instanceof BiliApiException b ? b.toErrorMsg()
                         : "真实发布异常: " + e.getMessage();
+                // 稿件提交（进度 95）之前失败的，远端不可能已有稿件：网络抖动就自动回队重传，
+                // 无人值守跑通宵时偶发 DNS/断网不至于把整批作品全刷成"发布失败"。
+                // 提交之后（进度 ≥95）一律落 FAILED 交人工——自动重试会产生重复稿件。
+                int pct = realProgress.getOrDefault(id, 0);
+                if (pct < 95 && isNetworkFault(msg) && tryNetworkRetry(id, p.getWorkId(), msg)) return;
                 failTask(id, p.getWorkId(), msg);
             }
         });
@@ -457,6 +470,45 @@ public class PublishServiceImpl implements PublishService {
         }
     }
 
+    /** 上传阶段的失败原因是否属于"网络本身不通"（而非鉴权/风控/参数被平台拒绝） */
+    private static boolean isNetworkFault(String msg) {
+        if (msg == null) return false;
+        return msg.contains("网络异常") || msg.contains("网络请求失败") || msg.contains("I/O error")
+                || msg.contains("Connection") || msg.contains("timed out") || msg.contains("超时");
+    }
+
+    /**
+     * 网络抖动自动回队重传：还在上传阶段（远端无稿件）时才允许。
+     *
+     * @return true 表示已回队、调用方不要再落 FAILED
+     */
+    private boolean tryNetworkRetry(long taskId, Long workId, String msg) {
+        int n = networkRetries.merge(taskId, 1, Integer::sum);
+        if (n > NETWORK_RETRY_MAX) {
+            log.warn("发布任务 {} 网络抖动自动重传已用尽（{} 次），落 FAILED 交人工", taskId, NETWORK_RETRY_MAX);
+            return false;
+        }
+        taskMapper.update(null, Wrappers.<PublishTask>lambdaUpdate()
+                .set(PublishTask::getStatus, "QUEUED")
+                .set(PublishTask::getProgress, 0)
+                .set(PublishTask::getPhaseSec, 0)
+                .set(PublishTask::getErrorMsg,
+                        "网络抖动，第 " + n + "/" + NETWORK_RETRY_MAX + " 次自动重传（上一轮：" + trimMsg(msg) + "）")
+                .eq(PublishTask::getId, taskId));
+        realEnqueued.remove(taskId);
+        realProgress.remove(taskId);
+        reviewSince.remove(taskId);
+        lastViewPoll.remove(taskId);
+        log.warn("发布任务 {} 上传阶段网络抖动，自动回队重传（第 {}/{} 次）: {}",
+                taskId, n, NETWORK_RETRY_MAX, msg);
+        return true;
+    }
+
+    private static String trimMsg(String s) {
+        if (s == null) return "发布失败";
+        return s.substring(0, Math.min(240, s.length()));
+    }
+
     private void failTask(long taskId, Long workId, String errorMsg) {
         String msg = errorMsg == null ? "发布失败" : errorMsg.substring(0, Math.min(480, errorMsg.length()));
         taskMapper.update(null, Wrappers.<PublishTask>lambdaUpdate()
@@ -467,6 +519,7 @@ public class PublishServiceImpl implements PublishService {
         realEnqueued.remove(taskId);
         reviewSince.remove(taskId);
         lastViewPoll.remove(taskId);
+        networkRetries.remove(taskId);
         log.warn("发布任务 {} FAILED: {}", taskId, msg);
     }
 

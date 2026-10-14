@@ -655,7 +655,10 @@ public class BiliClient {
      * 全部失败抛 {@link BiliApiException}(-6)，消息带真实 HTTP 状态与响应片段，便于定位。
      */
     private void putChunkWithRetry(String url, byte[] chunk, HttpHeaders headers, int partNo, int total) {
-        int attempts = 3;
+        // 本机到 CDN 偶发整段 DNS/连接抖动（实测 16:12 一次 5 片上传里末片连续 3 次 UnknownHost
+        // 直接把整支稿件判死，前面 4 片白传）。单片重试放宽到 5 次、退避到 8s，
+        // 一次抖动约 20s 内自愈，不必走"换令牌整段重传"。
+        int attempts = 5;
         String lastErr = "未知错误";
         for (int a = 1; a <= attempts; a++) {
             try {
@@ -673,7 +676,7 @@ public class BiliClient {
             log.warn("bili upos 分片 {}/{} 第 {}/{} 次 PUT 失败: {}", partNo, total, a, attempts, lastErr);
             if (a < attempts) {
                 try {
-                    Thread.sleep(1200L * a);
+                    Thread.sleep(2000L * a);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     break;
