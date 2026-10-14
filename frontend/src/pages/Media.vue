@@ -152,7 +152,7 @@ onMounted(() => { load(); loadStats() })
             <tr v-for="(f, i) in files" :key="i">
               <td><input type="checkbox" :checked="f.ref && selected.has(f.ref.id)" :disabled="!f.ref" @change="toggleCheck(f.ref.id)" /></td>
               <td>{{ f.name || '--' }}</td>
-              <td class="num muted">{{ fmtBytes(f.size_bytes) }}</td>
+              <td class="num muted">{{ f.size_bytes ? fmtBytes(f.size_bytes) : '—' }}</td>
               <td class="num muted">{{ fmtTime(f.created_at) }}</td>
               <td><span class="copyable trunc hint" style="max-width: 320px" :title="f.path + '（点击复制）'" @click="copyPath(f.path)">{{ f.path }}</span></td>
               <td>

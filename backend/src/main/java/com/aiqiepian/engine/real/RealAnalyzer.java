@@ -453,7 +453,43 @@ public class RealAnalyzer implements Analyzer {
             if (!overlap) picked.add(w);
         }
         picked.sort(Comparator.comparingDouble((Window w) -> w.start));
-        return picked;
+        return mergeAdjacent(picked);
+    }
+
+    /**
+     * 把首尾相接的窗口并成一段。滑窗步长是窗宽的 1/4，一段连续的精彩必然会被切成好几个
+     * 等长且紧挨着的窗口（实测 750-810 / 810-870、69-108 / 109-147 各自成条），
+     * 片段列表里就是好几条"看起来一模一样"的等长片段。它们描述的是同一段高光，
+     * 合并后端数更少、每段更完整，集锦也不会再把同一段连续画面拆成两刀。
+     *
+     * @param asc 已按 start 升序、互不重叠的窗口
+     */
+    static List<Window> mergeAdjacent(List<Window> asc) {
+        if (asc.size() < 2) return asc;
+        List<Window> out = new ArrayList<>();
+        Window cur = asc.get(0);
+        for (Window nx : asc.subList(1, asc.size())) {
+            // 允许的"看起来还是同一段"的最大间隔：窗宽的一成，下限 5 秒
+            double maxGap = Math.max(5, (cur.end - cur.start) * 0.1);
+            if (nx.start - cur.end > maxGap) {
+                out.add(cur);
+                cur = nx;
+                continue;
+            }
+            Window m = new Window(cur.start, Math.max(cur.end, nx.end));
+            m.loudMax = Math.max(cur.loudMax, nx.loudMax);
+            m.loudNorm = Math.max(cur.loudNorm, nx.loudNorm);
+            m.sceneCount = cur.sceneCount + nx.sceneCount;
+            m.sceneNorm = Math.max(cur.sceneNorm, nx.sceneNorm);
+            m.heat = cur.heat + nx.heat;          // 区间互不重叠，弹幕数按真实跨度累加
+            m.heatNorm = Math.max(cur.heatNorm, nx.heatNorm);
+            m.speechCov = Math.max(cur.speechCov, nx.speechCov);
+            m.base = Math.max(cur.base, nx.base); // 分数取峰值：合并不是把精彩摊薄
+            m.llmReason = cur.llmReason != null ? cur.llmReason : nx.llmReason;
+            cur = m;
+        }
+        out.add(cur);
+        return out;
     }
 
     /**

@@ -68,8 +68,15 @@ public class MediaServiceImpl implements MediaService {
                 Map<Long, Work> byClip = worksByClipId();
                 for (Clip c : clipMapper.selectList(
                         Wrappers.<Clip>lambdaQuery().orderByDesc(Clip::getId))) {
-                    File f = clipPlayable(c, byClip);
-                    if (f != null) list.add(entry(f, c.getCreatedAt(), new Ref("clip", c.getId())));
+                    Work w = c.getId() == null ? null : byClip.get(c.getId());
+                    File own = w == null ? null : existing(w.getOutputPath());
+                    File f = own != null ? own : clipPlayable(c, byClip);
+                    if (f == null) continue;
+                    // 片段本身不在磁盘上落独立文件（一条 60s 原画就是一两百 MB，整库要翻出几十 GB），
+                    // 播的是它的成片；没有成片时回落到所属会话的原始录制。过去这里把那个原始录制的
+                    // 文件名和大小原样抄成一行，于是同一场录制出现 N 行"一模一样的 953 MB 片段"，
+                    // 看着就是重复文件。现在按片段自身命名，大小也不冒领整场录制。
+                    list.add(clipEntry(c, f, own));
                 }
             }
             case "subtitles" -> {
@@ -407,6 +414,31 @@ public class MediaServiceImpl implements MediaService {
         r.put("id", ref.id);
         m.put("ref", r);
         return m;
+    }
+
+    /**
+     * 片段行：名字带自己的编号与时间区间（不再冒用整场录制的文件名），
+     * 没有自己的成片时大小记 0 并注明是原录制上的一段引用——否则 N 条片段会被看成 N 个重复的大文件。
+     */
+    private static Map<String, Object> clipEntry(Clip c, File playable, File ownOutput) {
+        String p = playable.getAbsolutePath().replace("\\.\\", "\\");
+        Map<String, Object> m = new LinkedHashMap<>();
+        boolean hasOwn = ownOutput != null;
+        m.put("name", "片段#" + c.getId() + " · " + (c.getRoomName() == null ? "" : c.getRoomName() + " ")
+                + clock(c.getStartSec()) + "–" + clock(c.getEndSec()) + (hasOwn ? "" : "（引用原录制）"));
+        m.put("path", p);
+        m.put("size_bytes", hasOwn ? playable.length() : 0L);
+        m.put("created_at", c.getCreatedAt());
+        Map<String, Object> r = new LinkedHashMap<>();
+        r.put("type", "clip");
+        r.put("id", c.getId());
+        m.put("ref", r);
+        return m;
+    }
+
+    private static String clock(Integer sec) {
+        int s = sec == null ? 0 : sec;
+        return String.format("%02d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60);
     }
 
     private static String basename(String p) {
