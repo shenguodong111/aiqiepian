@@ -52,6 +52,7 @@ const form = reactive({
   asr_enabled: true,
   reel_enabled: true,
   clip_dedup_enabled: true,
+  review_before_publish: true,
   asr_model: 'small',
   asr_language: 'zh',
   asr_python: '',
@@ -283,6 +284,19 @@ onUnmounted(stopQrPoll)
             <span>每次录制分析完成后，自动精选片段拼接成一支高光成片（真实引擎生效）</span>
           </label>
           <p class="hint">成片时长随录制总时长自适应（约录制时长的 1/3，最短 5 分钟、最长 20 分钟）。无弹幕或弹幕稀薄的直播间会优先用语音/画面信号选段。产物出现在剪辑工作台。</p>
+        </div>
+
+        <!-- 发布前人工审片 -->
+        <div class="card group">
+          <div class="group-title">发布前人工审片 <span class="badge cyan" style="margin-left: 8px">{{ form.review_before_publish ? '每支都要过目' : '机审通过即自动发布' }}</span></div>
+          <label class="check-line top-line">
+            <label class="switch"><input type="checkbox" v-model="form.review_before_publish" /><span class="track"></span></label>
+            <span>开启：机审通过的作品停在「待审片」，由你在剪辑工作台改标题/封面后点「通过并发布」</span>
+          </label>
+          <p class="hint">
+            关闭后，机审有把握（AUTO_PASS）的作品会<b>直接进入发布队列</b>，整条「监控 → 录制 → 分析 → 成片 → 上传」无人值守跑完；
+            机审拿不准的仍然留给人工。前提是已绑定 B 站账号且自动发布开启——投稿默认<b>仅自己可见</b>，需要公开请到 B 站创作中心改。
+          </p>
         </div>
 
         <!-- 轮播/重复内容去重 -->

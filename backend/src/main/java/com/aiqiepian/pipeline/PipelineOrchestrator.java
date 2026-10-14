@@ -56,6 +56,10 @@ public class PipelineOrchestrator {
     private static final int TICK_SEC = 3;
     /** 刚起录的这段时间内即便平台报"未开播"也不结束会话：开播瞬间状态位常有延迟/抖动 */
     private static final int START_GRACE_SEC = 120;
+    /** 上一次录制只录到这么点秒数，就认定"平台接口说在播、流其实没通" */
+    private static final int FLOP_SEC = 60;
+    /** 判定 flop 后，同一房间这么久之内不再起新录制（否则每 tick 起录→秒停→刷垃圾会话） */
+    private static final int FLOP_COOLDOWN_MIN = 5;
     private static final List<String> BLOCKED_WHEN_OFF = List.of("ANALYZE", "RENDER", "REVIEW", "PUBLISH");
 
     private final LiveRoomMapper roomMapper;
@@ -188,6 +192,22 @@ public class PipelineOrchestrator {
         cur.setProgress(0);
         cur.setLog(jobType + " 开始执行");
         jobMapper.updateById(cur);
+    }
+
+    /**
+     * 该房间最近一次录制是否"接口说在播、流却没通"（{@value #FLOP_COOLDOWN_MIN} 分钟内起录、
+     * 却只录到不到 {@value #FLOP_SEC} 秒）。为真时调度侧应冷却后再起录，而不是每 tick 重试。
+     */
+    private boolean justFlopped(long roomId, LocalDateTime now) {
+        RecordingSession last = sessionMapper.selectOne(Wrappers.<RecordingSession>lambdaQuery()
+                .eq(RecordingSession::getRoomId, roomId)
+                .orderByDesc(RecordingSession::getId)
+                .last("limit 1"));
+        if (last == null || last.getStartedAt() == null) return false;
+        if (last.getStartedAt().isBefore(now.minusMinutes(FLOP_COOLDOWN_MIN))) return false;
+        if ("RECORDING".equals(last.getStatus())) return false; // 还在录就不算 flop
+        int captured = last.getRecordedSec() == null ? 0 : last.getRecordedSec();
+        return captured < FLOP_SEC;
     }
 
     /**
@@ -328,6 +348,12 @@ public class PipelineOrchestrator {
                     if (roomChanged) roomMapper.updateById(room);
                     // 检测到开播但平台取流未支持（如斗鱼）：只刷新状态与标题，不起录制，避免每 tick 重复失败
                     if (!recorder.supportsRealRecording(room.getPlatform())) {
+                        continue;
+                    }
+                    if (real && justFlopped(room.getId(), now)) {
+                        // 平台接口说"在播"，但上一次起录几十秒内就没录到内容（流已死/被限流）：
+                        // 立刻再起只会重复"起录→秒停→空会话"，把录制列表塞满垃圾行、把 ffmpeg 线程烧光。
+                        // 冷却一段时间再试，真开播了最多晚几分钟开始录。
                         continue;
                     }
                     try {
@@ -538,7 +564,17 @@ public class PipelineOrchestrator {
             workMapper.updateById(w);
             return;
         }
-        // AUTO_PASS 或不确定：统一进 PENDING_REVIEW，等人工审片改标题/标签后点「通过并发布」
+        // 默认 AUTO_PASS 也停在 PENDING_REVIEW，等人工审片改标题/标签后点「通过并发布」。
+        // 关掉"发布前人工审片"（设置 review_before_publish=false）后，机审有把握的作品直接入队发布，
+        // "监控→录制→分析→成片→上传"才能真正无人值守跑完；不确定的（MANUAL）照旧留给人工。
+        if ("AUTO_PASS".equals(d.getDecision()) && !settings.getBool("review_before_publish", true)) {
+            w.setStatus("APPROVED");
+            w.setUpdatedAt(now);
+            workMapper.updateById(w);
+            pipeline.queuePublish(w);
+            log.info("作品 {} 机审 AUTO_PASS，已关闭发布前人工审片 → 直接进入发布队列", w.getId());
+            return;
+        }
         w.setStatus("PENDING_REVIEW");
         w.setUpdatedAt(now);
         workMapper.updateById(w);

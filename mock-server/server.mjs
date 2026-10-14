@@ -32,6 +32,7 @@ const db = {
     sensitive_words: '',
     manual_on_uncertain: true,
     auto_publish: true,
+    review_before_publish: true,
     media_dir: './media',
     keep_days: 30,
     ai_mode: 'mock',
@@ -192,6 +193,9 @@ function reviewDone(w) {
   else { decision = 'MANUAL'; reason = `评分 ${w.score} 处于人工区间 [${st.auto_reject_score}, ${st.auto_pass_score})，交人工处理` }
   db.reviews.push({ id: nid(), work_id: w.id, decision, confidence, reason, operator: 'system', created_at: now() })
   if (decision === 'AUTO_PASS') {
+    // 与真实引擎一致：开着"发布前人工审片"时，机审通过也只是进「待审片」，
+    // 由人在剪辑工作台改标题/封面后点「通过并发布」；关掉才直接入队。
+    if (st.review_before_publish !== false) { w.status = 'PENDING_REVIEW'; w.updated_at = now(); return }
     w.status = 'APPROVED'; w.updated_at = now()
     if (st.auto_publish && db.account && roomAutoPublishAllowed(w)) queuePublish(w)
   } else if (decision === 'AUTO_REJECT') { w.status = 'REJECTED'; w.updated_at = now() }

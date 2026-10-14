@@ -83,6 +83,9 @@ public class SettingsServiceImpl implements SettingsService, ApplicationRunner {
         m.put("sensitive_words", "");
         m.put("manual_on_uncertain", true);
         m.put("auto_publish", true);
+        // ---- 发布前是否必须人工审片：true=每支作品都要人点「通过并发布」（默认，稳妥）；
+        //      false=机审 AUTO_PASS 的作品直接入队发布，整条链路无人值守跑到底 ----
+        m.put("review_before_publish", true);
         m.put("media_dir", "./media");
         m.put("keep_days", 30);
         m.put("ai_mode", "mock");

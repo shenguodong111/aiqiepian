@@ -53,6 +53,9 @@ public class PipelineServiceImpl implements PipelineService {
     /** 发布前（可安全补全标题/简介）的作品状态集合 */
     private static final Set<String> PRE_PUBLISH = Set.of("DRAFT", "RENDERING", "READY", "APPROVED");
 
+    /** 低于这个真实秒数的录制不做片段分析：比最小选段窗口（25s）还短，注定空跑 */
+    private static final int MIN_ANALYZABLE_SEC = 30;
+
     private final LiveRoomMapper liveRoomMapper;
     private final RecordingSessionMapper sessionMapper;
     private final ClipMapper clipMapper;
@@ -141,6 +144,26 @@ public class PipelineServiceImpl implements PipelineService {
         } else {
             s.setRecordedSec(s.getDurationSec());
             recorder.stop(s);
+        }
+        int captured = nz(s.getRecordedSec());
+        if (realMode() && captured < MIN_ANALYZABLE_SEC) {
+            // 斗鱼/虎牙偶发"接口说在播、流其实已死"：起录几秒就停，这种会话装不下最小选段窗口
+            // （窗宽 25–60s），分析只会空跑一遍 ffmpeg/Whisper 并白占重活线程。
+            // 不排 ANALYZE，保持"未分析"，并把原因写进录制环节日志，界面看得到为什么没出片段。
+            s.setAnalyzeStatus("NONE");
+            sessionMapper.updateById(s);
+            LiveRoom shortRoom = liveRoomMapper.selectById(s.getRoomId());
+            if (shortRoom != null && "RECORDING".equals(shortRoom.getStatus())) {
+                shortRoom.setStatus("MONITORING");
+                liveRoomMapper.updateById(shortRoom);
+            }
+            PipelineJob rec = activeJob("RECORD", "session", s.getId());
+            if (rec != null) {
+                rec.setLog(nvl(rec.getLog()) + "；只录到 " + captured + " 秒，过短未做片段分析");
+                jobMapper.updateById(rec);
+            }
+            log.info("会话 {} 只录到 {} 秒（<{}s），跳过片段分析", s.getId(), captured, MIN_ANALYZABLE_SEC);
+            return;
         }
         s.setAnalyzeStatus("PENDING");
         sessionMapper.updateById(s);
