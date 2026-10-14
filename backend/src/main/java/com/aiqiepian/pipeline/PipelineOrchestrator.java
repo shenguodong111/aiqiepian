@@ -38,6 +38,7 @@ import jakarta.annotation.PreDestroy;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -79,6 +80,9 @@ public class PipelineOrchestrator {
     /** real 模式下已提交给重活线程池、尚未跑完的 job 数量（按类型）：用于兑现并发上限设置 */
     private final Map<String, Integer> inFlight = new ConcurrentHashMap<>();
 
+    /** 已派发给重活线程池的 job id：RUNNING 的行每轮都会被扫到，靠它保证一个 job 只派发一次 */
+    private final Set<Long> heavyDispatched = ConcurrentHashMap.newKeySet();
+
     /** mock | real：real 模式下录制/监控走真实引擎（ffmpeg + B站 API），mock 行为保持原样 */
     @Value("${engine.mode:mock}")
     private String engineMode;
@@ -103,6 +107,16 @@ public class PipelineOrchestrator {
      */
     private ExecutorService heavyExecutor;
 
+    /**
+     * 轻环节（审片 / 上传发布）专用线程池：这些环节是查库判定 + 网络 IO，不吃 CPU。
+     * 与重活同池时，一次二十分钟的 Whisper/编码会把审片与发布整段压住——实测 work 897 的 REVIEW
+     * 排了 45s 以上还没被拉起，而它本身只需要几百毫秒。
+     */
+    private ExecutorService lightExecutor;
+
+    /** 走重活池的环节（真会跑 ffmpeg/Whisper 的） */
+    private static final Set<String> HEAVY_TYPES = Set.of("ANALYZE", "RENDER");
+
     @PostConstruct
     void initExecutor() {
         int size = Math.max(1, settings.getInt("max_concurrent_heavy", 2));
@@ -111,10 +125,16 @@ public class PipelineOrchestrator {
             t.setDaemon(true);
             return t;
         });
+        lightExecutor = Executors.newFixedThreadPool(2, r -> {
+            Thread t = new Thread(r, "pipeline-light");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     @PreDestroy
     void shutdownExecutor() {
+        if (lightExecutor != null) lightExecutor.shutdownNow(); // 轻环节无产物写入，直接停即可
         if (heavyExecutor == null) return;
         // 先 shutdown（不中断正在跑的线程）给"片段入库"这类短关键段一个收尾窗口，
         // 超过 45s 还在跑的重活（Whisper/编码）才强制掐掉——被掐的那次会由启动补排重跑。
@@ -129,19 +149,75 @@ public class PipelineOrchestrator {
         }
     }
 
-    /** 把 job 成功后的真实工作移出调度线程执行；异常仅记录（job 已置 SUCCESS，与旧同步行为一致，不重复触发） */
+    /** 把 job 的真实工作移出调度线程执行；real 模式下由这里兑现 job 的终态（成功/失败） */
     private void submitHeavy(PipelineJob j, LocalDateTime now) {
+        long jobId = j.getId() == null ? -1 : j.getId();
+        if (jobId < 0 || !heavyDispatched.add(jobId)) return; // 已派发过，等它自己跑完
+        boolean heavy = HEAVY_TYPES.contains(j.getJobType());
         if (realMode()) inFlight.compute(j.getJobType(), (k, v) -> v == null ? 1 : v + 1);
-        heavyExecutor.submit(() -> {
+        (heavy ? heavyExecutor : lightExecutor).submit(() -> {
+            String note;
+            boolean ok;
             try {
                 onJobSuccess(j, now);
+                ok = true;
+                note = "真实引擎执行完成";
             } catch (Exception e) {
+                ok = false;
+                note = "执行异常：" + e;
                 log.error("后台执行真实工作异常 type={} entityId={}: {}",
                         j.getJobType(), j.getEntityId(), e.toString(), e);
             } finally {
+                heavyDispatched.remove(jobId);
                 if (realMode()) inFlight.compute(j.getJobType(), (k, v) -> v == null || v <= 1 ? null : v - 1);
             }
+            if (realMode()) finishJob(jobId, ok, note, j.getJobType(), j.getEntityType(), j.getEntityId());
         });
+    }
+
+    /**
+     * 发布环节的真实结果只写在 publish_task（状态机单独推进），job 这边过去什么都不做就直接
+     * SUCCESS——于是发布中心一片"失败"，管线列表却显示环节完成，用户完全看不出哪儿断了
+     * （实测 -101 Cookie 失效就是这样被吞掉的）。现在让 job 跟随任务落终态：
+     * 任务还在跑就保持 RUNNING，成功/失败才写结论，并把任务里的失败原因带进 job 日志。
+     */
+    private void syncPublishJob(PipelineJob j, LocalDateTime now) {
+        Long jobId = j.getId();
+        if (jobId == null) return;
+        PublishTask t = publishMapper.selectOne(Wrappers.<PublishTask>lambdaQuery()
+                .eq(PublishTask::getWorkId, j.getEntityId())
+                .orderByDesc(PublishTask::getId)
+                .last("limit 1"));
+        if (t == null) {
+            finishJob(jobId, false, "发布任务不存在（可能已被删除）",
+                    j.getJobType(), j.getEntityType(), j.getEntityId());
+            return;
+        }
+        switch (nvl(t.getStatus())) {
+            case "PUBLISHED" -> finishJob(jobId, true, "稿件已提交 bvid=" + nvl(t.getRemoteId()),
+                    j.getJobType(), j.getEntityType(), j.getEntityId());
+            case "FAILED" -> finishJob(jobId, false, "发布失败：" + nvl(t.getErrorMsg()),
+                    j.getJobType(), j.getEntityType(), j.getEntityId());
+            default -> {
+                // QUEUED / 上传中：保持 RUNNING，下一轮 tick 再看
+            }
+        }
+    }
+
+    /**
+     * 重活跑完后回写 job 终态。
+     * 失败置 FAILED 交给既有的重试逻辑（FAILED→PENDING，受 max_retry 约束），
+     * 成功才置 SUCCESS——进度条从此反映的是真实执行情况，而不是排队时的假递增。
+     */
+    private void finishJob(long jobId, boolean ok, String note, String jobType, String entityType, Long entityId) {
+        PipelineJob fresh = jobMapper.selectById(jobId);
+        if (fresh == null || !"RUNNING".equals(fresh.getStatus())) return; // 已被停止/重置，不越权改写
+        fresh.setStatus(ok ? "SUCCESS" : "FAILED");
+        fresh.setProgress(ok ? 100 : 0);
+        fresh.setFinishedAt(ok ? LocalDateTime.now() : null);
+        fresh.setLog(nvl(fresh.getLog()) + "；" + note);
+        jobMapper.updateById(fresh);
+        if (!ok) log.warn("环节执行失败待重试 type={} {}={}：{}", jobType, entityType, entityId, note);
     }
 
     /**
@@ -311,8 +387,10 @@ public class PipelineOrchestrator {
             }
             if ("RUNNING".equals(j.getStatus())) {
                 if (real) {
-                    // 真实引擎不做假进度/随机失败：job 一进入 RUNNING 就当轮交付重活线程池执行。
-                    // 过去每 3s tick 才涨 12~35 的假进度，一个分析要 4~8 轮（12~25s）才真正开跑，
+                    // 真实引擎不做假进度/随机失败：进 RUNNING 就派发给重活线程池，
+                    // 行本身保持 RUNNING，由干活的线程跑完再写 SUCCESS/FAILED——
+                    // 否则界面看到"环节已完成 100%"而实际分析/渲染还在跑（上一版就栽在这里）。
+                    // 过去每 3s tick 才涨 12~35 的假进度，一个环节要 4~8 轮（12~25s）才真正开跑，
                     // 还有 4% 随机"引擎超时"把好好的录制 job 刷成 FAILED 反复重试。
                     if ("RECORD".equals(j.getJobType())) {
                         RecordingSession s = sessionMapper.selectById(j.getEntityId());
@@ -325,11 +403,10 @@ public class PipelineOrchestrator {
                         }
                         continue; // 进度由第 2 步按真实录制时长写入
                     }
-                    j.setProgress(100);
-                    j.setStatus("SUCCESS");
-                    j.setFinishedAt(now);
-                    j.setLog(nvl(j.getLog()) + "；交由真实引擎执行");
-                    jobMapper.updateById(j);
+                    if ("PUBLISH".equals(j.getJobType())) {
+                        syncPublishJob(j, now); // 发布的真相在 publish_task 里，job 只跟着它落终态
+                        continue;
+                    }
                     submitHeavy(j, now);
                     continue;
                 }
@@ -450,9 +527,14 @@ public class PipelineOrchestrator {
                 .eq(PipelineJob::getStatus, "RUNNING"));
     }
 
-    /** 某类 job 当前占用中的数量：mock 看表里的 RUNNING 行，real 看已提交未完成的重活 */
+    /** 某类 job 当前占用中的数量：mock 看表里的 RUNNING 行，real 两者取大 */
     private int busyCount(String jobType, boolean real) {
-        return real ? inFlightCount(jobType) : (int) runningCount(jobType);
+        int dbRunning = (int) runningCount(jobType);
+        if (!real) return dbRunning;
+        // inFlight 要到下一轮 tick 派发时才 +1，同一轮里多条 PENDING 会一起跨过额度（实测一次放进
+        // 4 条 ANALYZE，界面看着全在跑、实际只有 2 个线程在跑）。real 的 RUNNING 行不含僵尸
+        // （启动时由 PipelineRecovery 打回队列），所以取两者较大即当前真实占用。
+        return Math.max(inFlightCount(jobType), dbRunning);
     }
 
     /** 敏感词黑名单：一行一词 */

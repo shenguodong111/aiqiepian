@@ -92,7 +92,7 @@ public final class ClipFingerprint {
         try {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectError(ProcessBuilder.Redirect.DISCARD); // 只保留 stdout 的裸帧数据
-            p = pb.start();
+            p = FfmpegSupport.startOwned(pb);
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             try (InputStream in = p.getInputStream()) {
                 byte[] buf = new byte[8192];
@@ -111,8 +111,11 @@ public final class ClipFingerprint {
             return out.toByteArray();
         } catch (Exception e) {
             if (p != null) p.destroyForcibly();
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
             log.warn("指纹抽帧异常 {}: {}", String.join(" ", cmd), e.toString());
             return null;
+        } finally {
+            FfmpegSupport.finish(p);
         }
     }
 

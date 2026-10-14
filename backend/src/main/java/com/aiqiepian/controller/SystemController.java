@@ -2,6 +2,7 @@ package com.aiqiepian.controller;
 
 import com.aiqiepian.common.ApiResponse;
 import com.aiqiepian.engine.Recorder;
+import com.aiqiepian.engine.real.FfmpegSupport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.SpringApplication;
@@ -39,6 +40,9 @@ public class SystemController {
             } catch (InterruptedException ignored) {
                 Thread.currentThread().interrupt();
             }
+            // 先关闸：从现在起不再启动新的 ffmpeg/python 子进程（被打断的渲染会试图回退重剪，
+            // 那种进程没有线程等它，钩子跑完就成孤儿）。
+            FfmpegSupport.markShuttingDown();
             // 先把录制收尾（合并分段）再关容器：容器关闭路径上调度器可能正卡在
             // 平台接口的 socket read 里，@PreDestroy 未必被执行，遗留分片会让整场录制不可分析。
             try {

@@ -611,7 +611,7 @@ public class RealAnalyzer implements Analyzer {
         try {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
-            p = pb.start();
+            p = FfmpegSupport.startOwned(pb);
             final Process fp = p;
             Thread reader = new Thread(() -> {
                 try (BufferedReader br = new BufferedReader(
@@ -634,8 +634,11 @@ public class RealAnalyzer implements Analyzer {
             return p.exitValue();
         } catch (Exception e) {
             if (p != null) p.destroyForcibly();
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
             log.warn("分析命令执行异常 {}: {}", String.join(" ", cmd), e.toString());
             return -1;
+        } finally {
+            FfmpegSupport.finish(p);
         }
     }
 }

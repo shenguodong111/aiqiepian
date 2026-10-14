@@ -131,7 +131,7 @@ public class AsrClient {
             pb.environment().put("HF_HUB_OFFLINE", "1");
             pb.environment().put("PYTHONUTF8", "1");
             pb.environment().put("PYTHONIOENCODING", "utf-8");
-            Process p = pb.start();
+            Process p = FfmpegSupport.startOwned(pb);
             StringBuilder out = new StringBuilder();
             Thread reader = new Thread(() -> {
                 try (var br = new java.io.BufferedReader(new java.io.InputStreamReader(
@@ -148,10 +148,14 @@ public class AsrClient {
             });
             reader.setDaemon(true);
             reader.start();
-            if (!p.waitFor(ASR_TIMEOUT_SEC, TimeUnit.SECONDS)) {
-                p.destroyForcibly();
-                log.warn("ASR 转写超时(>{}s)，仅标题条", ASR_TIMEOUT_SEC);
-                return null;
+            try {
+                if (!p.waitFor(ASR_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+                    p.destroyForcibly();
+                    log.warn("ASR 转写超时(>{}s)，仅标题条", ASR_TIMEOUT_SEC);
+                    return null;
+                }
+            } finally {
+                FfmpegSupport.finish(p);
             }
             int code = p.exitValue();
             boolean ok = code == 0 && nonEmpty(srtPath);
@@ -214,7 +218,7 @@ public class AsrClient {
             pb.environment().put("HF_HUB_OFFLINE", "1");
             pb.environment().put("PYTHONUTF8", "1");
             pb.environment().put("PYTHONIOENCODING", "utf-8");
-            Process p = pb.start();
+            Process p = FfmpegSupport.startOwned(pb);
             // 消费输出避免管道阻塞（whisper 可能打印进度）
             Thread reader = new Thread(() -> {
                 try (var br = new java.io.BufferedReader(new java.io.InputStreamReader(
@@ -227,10 +231,14 @@ public class AsrClient {
             reader.start();
             // 超时按时长放大：whisper small/CPU 约 0.5~1.5x 实时，留 3x 余量，钳 10~90 分钟
             long timeout = Math.max(600, Math.min(5400, (long) (durationSec * 3)));
-            if (!p.waitFor(timeout, TimeUnit.SECONDS)) {
-                p.destroyForcibly();
-                log.warn("语音时间轴提取超时(>{}s, dur={}s)，跳过语音通道", timeout, (long) durationSec);
-                return windows;
+            try {
+                if (!p.waitFor(timeout, TimeUnit.SECONDS)) {
+                    p.destroyForcibly();
+                    log.warn("语音时间轴提取超时(>{}s, dur={}s)，跳过语音通道", timeout, (long) durationSec);
+                    return windows;
+                }
+            } finally {
+                FfmpegSupport.finish(p);
             }
             if (p.exitValue() != 0 || !Files.isRegularFile(tl) || Files.size(tl) == 0) {
                 log.info("语音时间轴为空或失败(exit={})，无弹幕时降级为响度+场景", p.exitValue());

@@ -5,11 +5,14 @@ import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /** ffmpeg / ffprobe 子进程工具：执行、超时、输出消费与转义。 */
@@ -18,7 +21,78 @@ public final class FfmpegSupport {
     private static final Logger log = LoggerFactory.getLogger(FfmpegSupport.class);
     private static final int OUTPUT_RING = 40;
 
+    /**
+     * 存活子进程登记表。被 shutdown 打断的渲染/分析线程来不及收尾时，子 ffmpeg 会活过 JVM
+     * （实测遗留一个持续写盘的孤儿进程），这里统一在退出时强杀。
+     *
+     * <p>注意 Windows 上 {@code destroyForcibly()} 只是**发起**终止，真正送达由 JVM 的
+     * process-reaper 线程异步完成；工作线程被打断后往往立刻 {@code System.exit}，reaper 来不及跑。
+     * 所以条目一律保留到确认进程已死为止，退出钩子负责再杀一次并等它落地。
+     */
+    private static final Set<Process> LIVE = ConcurrentHashMap.newKeySet();
+    private static volatile boolean stopping;
+
+    /** 退出钩子内每个子进程的确认等待上限 */
+    private static final long REAP_WAIT_SEC = 5;
+
+    static {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            stopping = true;
+            int killed = 0;
+            for (Process p : LIVE) {
+                if (!p.isAlive()) continue;
+                try {
+                    p.destroyForcibly();
+                    killed++;
+                } catch (Exception ignored) {
+                    // 子进程已自行退出
+                }
+            }
+            // 等终止送达：钩子线程活着，reaper 才有机会把 kill 落地
+            long deadline = System.currentTimeMillis() + REAP_WAIT_SEC * 1000L;
+            for (Process p : LIVE) {
+                long left = deadline - System.currentTimeMillis();
+                if (left <= 0) break;
+                try {
+                    p.waitFor(left, TimeUnit.SECONDS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            if (killed > 0) log.info("退出清理：强杀遗留子进程 {} 个", killed);
+        }, "ffmpeg-reaper"));
+    }
+
     private FfmpegSupport() {
+    }
+
+    /**
+     * 一键停止在关容器**之前**调用：此刻起不再接受新的子进程。
+     * 被打断的渲染会走"回退再剪一遍"这类补救路径，若不禁掉就会在退出窗口里又生出一个没人管的进程。
+     */
+    public static void markShuttingDown() {
+        stopping = true;
+    }
+
+    /**
+     * 启动登记在册的子进程；进入退出流程后拒绝启动（钩子已跑完，新进程无人回收，只会变成孤儿）。
+     */
+    public static Process startOwned(ProcessBuilder pb) throws IOException {
+        if (stopping) throw new IOException("应用正在退出，不再启动新的 ffmpeg/python 子进程");
+        LIVE.removeIf(p -> !p.isAlive()); // 顺手回收已确认死亡的条目，登记表不会随分片式录制膨胀
+        Process p = pb.start();
+        LIVE.add(p);
+        return p;
+    }
+
+    /**
+     * 子进程调用方收尾：确认已退出才摘册。
+     * 仍在跑（超时被杀、线程被打断）就留在册，交给下次启动清理或退出钩子，
+     * 否则 {@code System.exit} 一来就再没人知道它的 PID——孤儿进程正是这么留下的。
+     */
+    public static void finish(Process p) {
+        if (p != null && !p.isAlive()) LIVE.remove(p);
     }
 
     /**
@@ -30,7 +104,7 @@ public final class FfmpegSupport {
         try {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
-            p = pb.start();
+            p = startOwned(pb);
             // 守护线程持续消费输出（防管道阻塞），主线程带超时等待
             LinkedList<String> ring = consumeOutput(p, OUTPUT_RING);
             if (!p.waitFor(timeoutSec, TimeUnit.SECONDS)) {
@@ -47,8 +121,11 @@ public final class FfmpegSupport {
             return code;
         } catch (Exception e) {
             if (p != null) p.destroyForcibly();
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
             log.warn("命令执行异常 {}: {}", String.join(" ", cmd), e.toString());
             return -1;
+        } finally {
+            finish(p);
         }
     }
 
@@ -115,7 +192,7 @@ public final class FfmpegSupport {
         try {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
-            p = pb.start();
+            p = startOwned(pb);
             try (BufferedReader br = new BufferedReader(
                     new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
@@ -130,8 +207,11 @@ public final class FfmpegSupport {
             return p.exitValue();
         } catch (Exception e) {
             if (p != null) p.destroyForcibly();
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
             log.warn("命令执行异常 {}: {}", String.join(" ", cmd), e.toString());
             return -1;
+        } finally {
+            finish(p);
         }
     }
 }
