@@ -70,6 +70,7 @@ const form = reactive({
   bili_uid: '',
   bili_browser_cookie: '',
   publish_tid: 244,
+  publish_visibility: 'private',
   max_record_minutes: 240,
 })
 const keyMasked = ref('')
@@ -308,7 +309,7 @@ onUnmounted(stopQrPoll)
           </label>
           <p class="hint">
             关闭后，机审有把握（AUTO_PASS）的作品会<b>直接进入发布队列</b>，整条「监控 → 录制 → 分析 → 成片 → 上传」无人值守跑完；
-            机审拿不准的仍然留给人工。前提是已绑定 B 站账号且自动发布开启——投稿默认<b>仅自己可见</b>，需要公开请到 B 站创作中心改。
+            机审拿不准的仍然留给人工。前提是已绑定 B 站账号且自动发布开启——稿件是公开还是仅自己可见由下方「发布 → 稿件可见范围」决定。
           </p>
         </div>
 
@@ -352,6 +353,17 @@ onUnmounted(stopQrPoll)
           <div class="group-title">发布</div>
           <label class="field"><span>默认标签（逗号分隔）</span><input class="input" v-model="form.publish_default_tags" placeholder="直播切片,AI剪辑" /></label>
           <label class="field"><span>投稿分区 ID（tid）</span><input class="input" type="number" v-model.number="form.publish_tid" placeholder="244" /></label>
+          <label class="field"><span>稿件可见范围</span>
+            <select class="input" v-model="form.publish_visibility">
+              <option value="private">仅自己可见（默认）</option>
+              <option value="public">公开（所有人可见）</option>
+            </select>
+          </label>
+          <p class="hint" :style="form.publish_visibility === 'public' ? 'color:#e8a33d' : ''">
+            {{ form.publish_visibility === 'public'
+              ? '注意：改成「公开」后，此后每一支发布出去的稿件都会直接全站可见（出现在你的主页，并给粉丝推动态）。建议保持「发布前人工审片」开启，标题/封面都过目再放出去。只影响此后新发布的稿件，已经发出去的不受改动。'
+              : '提交后程序会用 web/edit 把稿件钉成「仅自己可见」，别人搜不到、也不进你的主页；这是 M3 起的安全策略。想让新稿件直接公开，把上面改成「公开」并保存即可；已经发出去的私密稿件要到 B 站创作中心 → 稿件管理 → 可见范围 逐支改。' }}
+          </p>
           <div class="bili-auth">
             <div class="bili-auth-row">
               <span class="hint">B 站登录态</span>

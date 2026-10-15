@@ -112,6 +112,8 @@ public class SettingsServiceImpl implements SettingsService, ApplicationRunner {
         m.put("bili_uid", "");
         m.put("bili_browser_cookie", "");
         m.put("publish_tid", 234);
+        // 稿件可见范围：private=仅自己可见（默认，M3 起的安全策略）/ public=公开（发出去全站可见）
+        m.put("publish_visibility", "private");
         m.put("publish_cover_url", "");
         return m;
     }

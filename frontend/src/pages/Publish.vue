@@ -195,6 +195,17 @@ onUnmounted(() => clearInterval(timer))
             <span class="track"></span>
           </label>
         </div>
+        <!-- 稿件为什么发出去是"仅自己可见"，答案就在这个设置上，别让人再去设置页翻 -->
+        <div class="auto-line vis-line">
+          <div>
+            <div style="font-size: 13px; font-weight: 600">稿件可见范围</div>
+            <div class="hint">只影响此后新发布的稿件，已发布出去的不变</div>
+          </div>
+          <span class="badge" :class="store.settings?.publish_visibility === 'public' ? 'orange' : 'cyan'">
+            {{ store.settings?.publish_visibility === 'public' ? '公开（所有人可见）' : '仅自己可见' }}
+          </span>
+          <router-link class="btn sm ghost" to="/settings">去修改</router-link>
+        </div>
       </div>
     </div>
 
@@ -303,6 +314,7 @@ onUnmounted(() => clearInterval(timer))
 }
 .acct-right { min-width: 240px; }
 .auto-line { display: flex; align-items: center; justify-content: space-between; gap: 16px; background: var(--surface-2); border: var(--border); border-radius: 11px; padding: 12px 16px; }
+.vis-line { margin-top: 10px; }
 .strip { margin-top: 12px; padding: 10px 16px; display: flex; align-items: center; gap: 12px; }
 .strip-item { background: var(--surface-2); border: var(--border); border-radius: 999px; padding: 3px 12px; font-size: 12px; color: var(--text-2); max-width: 200px; }
 .table-wrap { padding: 6px 14px 14px; overflow-x: auto; }

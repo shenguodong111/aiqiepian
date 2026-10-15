@@ -54,6 +54,9 @@ public class BiliClient {
     /** 封面图上传：multipart(cover=图片, csrf)，成功返回 data.url，稿件提交时作为 cover 字段带上 */
     public static final String COVER_UP_URL = "https://member.bilibili.com/x/vu/web/cover/up";
     public static final String VIEW_URL = "https://api.bilibili.com/x/web-interface/view";
+    /** 设置项 publish_visibility 的两个取值：仅自己可见（默认）/ 公开 */
+    public static final String VIS_PRIVATE = "private";
+    public static final String VIS_PUBLIC = "public";
 
     private static final String UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -510,8 +513,8 @@ public class BiliClient {
     /**
      * POST /x/vu/web/add?csrf={bili_jct} 提交稿件，成功返回 data.bvid。
      * 实测（2026-10）：api/member 的 /x/web/archives 已 404/405 废弃，本接口仍可用。
-     * 转载稿件（copyright=2）必须带 source；可见性按需求固定"仅自己可见"（visibility=private + visible=1，
-     * 若平台不识别该字段，接口不会报错——最终以后台复核，见报告遗留风险）。
+     * 转载稿件（copyright=2）必须带 source；可见范围由设置项 {@code publish_visibility} 决定
+     * （private=仅自己可见 / public=公开），add 之后还会用 web/edit 再钉一次，见方法末尾说明。
      */
     public String submitArchive(String title, String tags, String desc, String cover,
                                 UploadOutcome upload, long mid) {
@@ -545,10 +548,12 @@ public class BiliClient {
                 "title", safeTitle.length() > 80 ? safeTitle.substring(0, 80) : safeTitle,
                 "desc", "")));
         body.put("dtime", null); // 立即提交（进平台审核），不定时发布
-        // 仅自己可见：is_only_self=1（edit 实测生效字段）+ visible/visibility 一并携带，add 阶段若识别则更好
-        body.put("is_only_self", 1);
-        body.put("visible", 1);
-        body.put("visibility", "private");
+        // 可见范围取自设置页「稿件可见范围」；is_only_self 是 web/edit 实测生效的字段，
+        // visible/visibility 一并携带（web/add 会静默忽略它们，见下面补一次 edit 的说明）
+        boolean onlySelf = !VIS_PUBLIC.equalsIgnoreCase(settings.getStr("publish_visibility", VIS_PRIVATE));
+        body.put("is_only_self", onlySelf ? 1 : 0);
+        body.put("visible", onlySelf ? 1 : 0);
+        if (onlySelf) body.put("visibility", "private");
 
         String url = WEB_ADD_URL + "?csrf=" + jct();
         String resp;
@@ -571,26 +576,27 @@ public class BiliClient {
         }
         log.info("bili web/add 提交成功: bvid={} aid={}", bvid, json.path("data").path("aid").asText());
 
-        // 私密保险（2026-10-10 实测）：/x/vu/web/add 会静默忽略 visible/visibility 字段（稿件按公开过审），
-        // 但 /x/vu/web/edit 认 is_only_self=1 → state=-50「仅自己可见」。提交后立即 edit 一次强制私密。
+        // 可见范围保险（2026-10-10 实测）：/x/vu/web/add 会静默忽略 visible/visibility 字段（稿件按公开过审），
+        // 但 /x/vu/web/edit 认 is_only_self（1=仅自己可见 → state=-50，0=公开）。所以提交后立即 edit 一次，
+        // 把范围钉成用户选的那个——选"公开"时这一步也照跑，避免哪天 add 的默认值变了却没人知道。
         // 失败不阻断主流程（稿件已提交，状态回读仍走原逻辑），仅告警。
         long aid = json.path("data").path("aid").asLong(0);
         try {
             body.put("aid", aid);
             body.put("bvid", bvid);
-            body.put("is_only_self", 1);
+            body.put("is_only_self", onlySelf ? 1 : 0);
             String editUrl = "https://member.bilibili.com/x/vu/web/edit?csrf=" + jct();
             JsonNode editRet = parse(postText(editUrl, mapper.writeValueAsString(body),
                     authHeaders(MediaType.APPLICATION_JSON)));
             int ec = editRet.path("code").asInt(-999);
             if (ec == 0) {
-                log.info("bili web/edit 私密化成功: bvid={}（state 应为 -50 仅自己可见）", bvid);
+                log.info("bili web/edit 可见范围已钉为「{}」: bvid={}", onlySelf ? "仅自己可见" : "公开", bvid);
             } else {
-                log.warn("bili web/edit 私密化未生效: bvid={} code={} message={}（稿件可能保持公开，请人工确认）",
-                        bvid, ec, editRet.path("message").asText(""));
+                log.warn("bili web/edit 设置可见范围「{}」未生效: bvid={} code={} message={}（请到创作中心核对该稿件的可见范围）",
+                        onlySelf ? "仅自己可见" : "公开", bvid, ec, editRet.path("message").asText(""));
             }
         } catch (RestClientException | java.io.IOException e) {
-            log.warn("bili web/edit 私密化请求异常（不影响已提交稿件）: {}", truncate(e.getMessage()));
+            log.warn("bili web/edit 设置可见范围请求异常（不影响已提交稿件）: {}", truncate(e.getMessage()));
         }
         return bvid;
     }
