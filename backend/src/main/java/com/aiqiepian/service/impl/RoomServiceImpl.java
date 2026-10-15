@@ -108,7 +108,12 @@ public class RoomServiceImpl implements RoomService {
         LiveRoom room = roomMapper.selectById(id);
         if (room == null) throw new BizException(404, "不存在");
         room.setMonitorEnabled(enabled);
-        room.setStatus(enabled ? "MONITORING" : "OFF");
+        // 正在录的房间不许被这个开关改状态：把 RECORDING 冲成 MONITORING，调度器就以为"这房间没在录"，
+        // 于是对同一路流再起一条录制——双开 ffmpeg、磁盘翻倍、同一场内容出两批片段（实测踩过）。
+        // 停用监控只影响"下一次的自动起录"；当前这条照常录到结束，要立刻停去录制任务点停止。
+        if (!"RECORDING".equals(room.getStatus())) {
+            room.setStatus(enabled ? "MONITORING" : "OFF");
+        }
         room.setUpdatedAt(LocalDateTime.now());
         roomMapper.updateById(room);
         return room;

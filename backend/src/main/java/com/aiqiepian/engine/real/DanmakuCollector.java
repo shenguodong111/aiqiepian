@@ -80,14 +80,6 @@ public class DanmakuCollector {
     private final Map<Long, Session> active = new ConcurrentHashMap<>();
 
     /**
-     * 录制开始时挂接（B 站通道，保持旧签名）。
-     * 由 RealRecorder.start 调用，绝不向调用方抛异常。
-     */
-    public void begin(String biliRoomId, long sessionId) {
-        begin(biliRoomId, sessionId, "bilibili");
-    }
-
-    /**
      * 按平台分发弹幕通道。落盘文件名一律 `{roomId}_{sessionId}_danmaku.jsonl`，
      * 行格式一律 `{"ts","uid","text"}`——分析侧（RealAnalyzer）只认这个文件名与字段，
      * 与平台无关，所以新增平台只需要多一条采集支路，选段评分/弹幕统计列/高频弹幕全部自动生效。
@@ -95,12 +87,14 @@ public class DanmakuCollector {
      * <p>斗鱼走 Python 旁路子进程：danmuproxy 的 8501-8506 只接受**静态 RSA 密钥交换**的
      * TLS1.2 套件（实测 ECDHE 一律被服务器 handshake_failure 拒绝），而 JDK17 的 SunJSSE
      * 支持的套件里 TLS_RSA_WITH_* 数量为 0，纯 Java 无法完成握手；Python 侧 OpenSSL 可正常协商。
+     *
+     * @param budgetSec 这场录制的时长上限（秒），用来给旁路进程加一道自我了断的保险
      */
-    public void begin(String roomId, long sessionId, String platform) {
+    public void begin(String roomId, long sessionId, String platform, long budgetSec) {
         try {
             String plat = platform == null ? "bilibili" : platform.trim().toLowerCase();
             if ("douyu".equals(plat)) {
-                startDouyuSidecar(roomId, sessionId);
+                startDouyuSidecar(roomId, sessionId, budgetSec);
                 return;
             }
             if ("huya".equals(plat)) {
@@ -143,7 +137,7 @@ public class DanmakuCollector {
     }
 
     /** 斗鱼：起 scripts/douyu-danmu.py 旁路子进程，逐行写同一份 jsonl */
-    private void startDouyuSidecar(String roomId, long sessionId) throws Exception {
+    private void startDouyuSidecar(String roomId, long sessionId, long budgetSec) throws Exception {
         String py = douyuPython();
         if (py == null) {
             log.info("斗鱼弹幕通道未启用：找不到能 import websocket 的 python"
@@ -156,10 +150,14 @@ public class DanmakuCollector {
             log.warn("斗鱼弹幕通道未启用：找不到采集脚本 {}", script);
             return;
         }
-        ProcessBuilder pb = new ProcessBuilder(py, script, "--room", roomId, "--out", out.toString());
+        // --seconds 是最后一道保险：即便 Java 侧被强杀、没人 destroy 这个子进程，它也会自己收手，
+        // 不会留下一个永远拉着弹幕流、还占着 jsonl 文件的孤儿进程（实测漏过三个，文件删不掉）。
+        long cap = budgetSec > 0 ? budgetSec + 600 : 12 * 3600L;
+        ProcessBuilder pb = new ProcessBuilder(py, script,
+                "--room", roomId, "--out", out.toString(), "--seconds", String.valueOf(cap));
         pb.redirectErrorStream(true);
         pb.directory(new java.io.File(System.getProperty("user.dir")));
-        Process p = pb.start();
+        Process p = FfmpegSupport.startOwned(pb);   // 登记在册：退出钩子会兜底强杀残留子进程
         Session s = new Session(out);
         s.sidecar = p;
         active.put(sessionId, s);
@@ -194,6 +192,19 @@ public class DanmakuCollector {
             log.debug("斗鱼弹幕旁路日志读取结束（session={}）: {}", sessionId, e.toString());
         } finally {
             active.remove(sessionId);
+            FfmpegSupport.finish(p);   // 确认退出才摘册；仍活着就留在册，交给退出钩子收拾
+        }
+    }
+
+    /**
+     * 容器关闭时收掉所有还在跑的采集通道（B 站 WS 线程 / 斗鱼旁路子进程）。
+     * 录制侧的 shutdownAll 只认识 ffmpeg，不认弹幕通道——漏了这一步，
+     * 一键停止后 python 旁路会一直活着占着 jsonl 文件（实测漏过三个孤儿进程）。
+     */
+    @jakarta.annotation.PreDestroy
+    public void shutdownAll() {
+        for (Long sessionId : new ArrayList<>(active.keySet())) {
+            end(sessionId);
         }
     }
 

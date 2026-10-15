@@ -2,6 +2,7 @@
 import { ref, reactive, computed, onMounted } from 'vue'
 import { http } from '../api/http'
 import { toast } from '../utils/toast'
+import { store } from '../stores/app'
 import LoadingBlock from '../components/LoadingBlock.vue'
 import EmptyState from '../components/EmptyState.vue'
 import Pagination from '../components/Pagination.vue'
@@ -182,14 +183,43 @@ async function batchSet(enabled) {
     checked.value = new Set()
     selecting.value = false
     load(true)
+    loadOverview()
   } catch { load(true) }
 }
 
-onMounted(load)
+// 「自动运行」只是总闸，真正决定有没有新素材的是每个房间的监控开关。
+// 两个开关分开摆着，就会出现"绿点亮着却一条都不产出"的误解——这里直接把真相说破。
+const overview = ref(null)
+async function loadOverview() {
+  try { overview.value = await http.get('/dashboard/summary', null, { silent: true }) } catch { overview.value = null }
+}
+const noRoomMonitored = computed(() => {
+  const s = overview.value?.stats
+  return !!s && store.settings?.auto_run !== false && s.rooms_monitoring === 0
+})
+async function monitorAll() {
+  try {
+    const d = await http.get('/rooms', { page: 1, size: 500 }, { silent: true })
+    const ids = (d.list || []).filter(r => !r.monitor_enabled).map(r => r.id)
+    if (!ids.length) return toast.success('所有直播间都已在监控中')
+    for (const id of ids) await http.post(`/rooms/${id}/toggle`, { enabled: true }, { silent: true })
+    toast.success(`已把 ${ids.length} 个直播间纳入监控，开播即自动录制`)
+    load(true)
+    loadOverview()
+  } catch { toast.error('开启监控失败') }
+}
+
+onMounted(() => { load(); loadOverview() })
 </script>
 
 <template>
   <div class="rooms-page">
+    <!-- 总开关亮着但一个房间都没监控 = 整条管线不会有新素材，说破它 -->
+    <div v-if="noRoomMonitored" class="card idle-bar">
+      <b>自动运行已开启，但没有任何直播间在监控</b>
+      <span class="hint">—— 不会有新录制，后面的片段分析、剪辑成片、发布自然不会发生。开启监控后主播一开播就会自动录、自动分析出高光集锦。</span>
+      <button class="btn primary" style="margin-left:auto" @click="monitorAll">全部纳入监控</button>
+    </div>
     <div class="filter-bar">
       <select class="input" v-model="filters.platform" @change="applyFilters">
         <option value="">全部平台</option>
@@ -339,6 +369,7 @@ onMounted(load)
 
 <style scoped>
 .rooms-page { display: flex; flex-direction: column; gap: 4px; }
+.idle-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 18px; margin-bottom: 12px; border-left: 3px solid #e0a33e; }
 div.field { display: block; margin-bottom: 12px; }
 div.field > span { display: block; font-size: 12px; color: var(--text-2); margin-bottom: 5px; }
 .asset-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }

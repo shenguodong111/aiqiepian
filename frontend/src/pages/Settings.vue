@@ -2,7 +2,7 @@
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { http } from '../api/http'
 import { toast } from '../utils/toast'
-import { store, loadSettings } from '../stores/app'
+import { store, loadSettings, setAutoRun } from '../stores/app'
 import { fmtBytes } from '../utils/format'
 import LoadingBlock from '../components/LoadingBlock.vue'
 import Modal from '../components/Modal.vue'
@@ -35,7 +35,8 @@ async function doCleanRedundant() {
 }
 
 const form = reactive({
-  auto_run: true,
+  // auto_run 故意不进这个表单：它是即时生效的全局开关，直接读写 store（与侧栏底部同一个），
+  // 否则"拨了没保存"或"保存时把别处刚改的值覆盖回去"都会让两处显示不一致。
   monitor_interval_sec: 60,
   max_concurrent_record: 3,
   max_concurrent_analyze: 2,
@@ -227,8 +228,8 @@ onUnmounted(stopQrPoll)
         <div class="card group">
           <div class="group-title">管线 <span class="hint" style="font-weight: 400">六环节调度参数</span></div>
           <label class="check-line top-line">
-            <label class="switch"><input type="checkbox" v-model="form.auto_run" /><span class="track"></span></label>
-            <span>自动运行总开关（关闭后不再产生新任务）</span>
+            <label class="switch"><input type="checkbox" :checked="!!store.settings?.auto_run" :disabled="!store.connected" @change="setAutoRun($event.target.checked)" /><span class="track"></span></label>
+            <span>自动运行总开关（关闭后不再产生新任务）<span class="hint" style="font-weight: 400"> · 拨动即刻生效，与侧栏底部是同一个开关</span></span>
           </label>
           <div class="form-2col">
             <label class="field"><span>监控轮询间隔（秒）</span><input class="input num" type="number" min="5" v-model.number="form.monitor_interval_sec" /></label>
@@ -389,7 +390,7 @@ onUnmounted(stopQrPoll)
       </div>
 
       <div class="save-bar card">
-        <span class="hint">修改后需点击保存；自动运行开关与侧栏底部开关联动一致。</span>
+        <span class="hint">除「自动运行总开关」（拨动即刻生效）外，其余修改需点击保存后生效。</span>
         <button class="btn primary" :disabled="saving" @click="save">{{ saving ? '保存中…' : '保存全部设置' }}</button>
       </div>
     </template>

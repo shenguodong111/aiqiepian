@@ -156,10 +156,15 @@ public class MediaServiceImpl implements MediaService {
                         }
                     }
                     File f = existing(s.getFilePath());
-                    if (f != null) { freed += f.length(); if (!f.delete()) f.deleteOnExit(); }
+                    if (f != null && deleteNow(f)) freed += f.length();
                     long remaining = clipMapper.selectCount(Wrappers.<Clip>lambdaQuery().eq(Clip::getSessionId, sid));
                     if (force && remaining == 0) {
                         sessionMapper.deleteById(sid);   // 会话及其全部下游记录彻底消失
+                        // 弹幕采集文件与分析同生命周期：会话行没了还留着，就是永远没人读的磁盘残留
+                        for (File dm : SessionFiles.danmakuFilesOf(
+                                new File(settings.getStr("media_dir", "./media")), sid)) {
+                            if (deleteNow(dm)) freed += dm.length();
+                        }
                     } else {
                         // 默认路径（含 force 但仍有片段留存）：保留会话行与片段，仅解除原始文件引用
                         sessionMapper.update(null, Wrappers.<RecordingSession>lambdaUpdate()
@@ -385,10 +390,7 @@ public class MediaServiceImpl implements MediaService {
                 RecordingSession s = sessionMapper.selectById(sid);
                 if (s != null && "FINISHED".equals(s.getStatus()) && s.getFilePath() != null) {
                     File f = existing(s.getFilePath());
-                    if (f != null) {
-                        freed += f.length();
-                        if (!f.delete()) f.deleteOnExit();
-                    }
+                    if (f != null && deleteNow(f)) freed += f.length();
                     sessionMapper.update(null, Wrappers.<RecordingSession>lambdaUpdate()
                             .set(RecordingSession::getFilePath, null)
                             .set(RecordingSession::getFileSizeBytes, 0L)
@@ -486,11 +488,27 @@ public class MediaServiceImpl implements MediaService {
         return f.isFile() ? f : null;
     }
 
+    /**
+     * 立刻删文件；删不掉（还被在跑的 ffmpeg / 浏览器占着）就挂 deleteOnExit 并记一条 WARN。
+     *
+     * <p>光靠 deleteOnExit 不够：一键停止走的是 halt()，不会执行这些登记，文件就悄悄留在盘上，
+     * 而引用它的那一行数据库记录已经没了——界面上再也看不见它（实测漏掉一个 254MB 的录制文件）。
+     * 所以这里把"没删掉"说出来，并指一条能扫孤儿文件的现成路径。
+     */
+    private static boolean deleteNow(File f) {
+        if (f.delete()) return true;
+        f.deleteOnExit();
+        log.warn("文件正被占用，本次没删掉：{}（{} MB）。它已不被任何记录引用，"
+                + "可到「设置 → 一键清理冗余」勾选清理孤儿文件，或停掉占用它的播放页后重试",
+                f.getAbsolutePath(), f.length() / 1048576);
+        return false;
+    }
+
     private static long deleteIfPresent(String path) {
         File f = existing(path);
         if (f == null) return 0;
         long len = f.length();
-        return f.delete() ? len : 0;
+        return deleteNow(f) ? len : 0;
     }
 
     private static void addRef(Set<String> set, String path) {

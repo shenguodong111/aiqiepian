@@ -152,7 +152,7 @@ public class RealRecorder implements Recorder {
         // 弹幕通道按平台分发（B站内置 WS / 斗鱼 Python 旁路 / 虎牙暂不采）。
         // 放在录制启动之后、且不进上面的 try：采集挂接失败绝不能把一次正常录制判成失败。
         try {
-            danmakuCollector.begin(roomId, session.getId(), platform);
+            danmakuCollector.begin(roomId, session.getId(), platform, maxMinutes * 60L);
         } catch (Exception de) {
             log.warn("弹幕采集挂接失败（降级为纯录制）: {}", de.toString());
         }

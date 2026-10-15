@@ -210,6 +210,13 @@ public class PipelineOrchestrator {
         return captured < FLOP_SEC;
     }
 
+    /** 该房间是否已有进行中的录制会话——起第二条前的硬校验，不依赖房间状态字段是否新鲜 */
+    private boolean hasActiveSession(long roomId) {
+        return sessionMapper.selectCount(Wrappers.<RecordingSession>lambdaQuery()
+                .eq(RecordingSession::getRoomId, roomId)
+                .eq(RecordingSession::getStatus, "RECORDING")) > 0;
+    }
+
     /**
      * 发布环节的真实结果只写在 publish_task（状态机单独推进），job 这边过去什么都不做就直接
      * SUCCESS——于是发布中心一片"失败"，管线列表却显示环节完成，用户完全看不出哪儿断了
@@ -348,6 +355,14 @@ public class PipelineOrchestrator {
                     if (roomChanged) roomMapper.updateById(room);
                     // 检测到开播但平台取流未支持（如斗鱼）：只刷新状态与标题，不起录制，避免每 tick 重复失败
                     if (!recorder.supportsRealRecording(room.getPlatform())) {
+                        continue;
+                    }
+                    if (real && hasActiveSession(room.getId())) {
+                        // 房间状态说"没在录"、数据库里却躺着进行中会话（状态被别处改过、或上次收尾没落库）：
+                        // 照状态起第二条就是同一路流双开 ffmpeg。以会话为准，把房间状态纠回来。
+                        room.setStatus("RECORDING");
+                        roomMapper.updateById(room);
+                        log.info("房间 {} 已有进行中会话但状态不是录制中，已按会话纠状态、不重复起录", room.getId());
                         continue;
                     }
                     if (real && justFlopped(room.getId(), now)) {

@@ -69,9 +69,11 @@ public class SystemController {
             }
             if (closer.isAlive()) {
                 log.warn("容器关闭 15 秒未完成（通常是页面还挂着媒体流/长连接），强制退出 JVM；"
-                        + "录制已在前面收尾，ffmpeg 闸也已关，不会有孤儿进程");
+                        + "录制已在前面收尾，下面的子进程清理会兜住孤儿");
             }
-            // halt 不再跑 shutdown hook：上面已经做过录制收尾，这里要的是"一定退得掉"
+            // halt 不跑 shutdown hook，所以子进程清理必须在这里**同步**做一次：
+            // 只挂钩子等于给这条路径留口子（实测一键停止后斗鱼弹幕旁路 python 还活着占着文件）。
+            FfmpegSupport.reapNow();
             Runtime.getRuntime().halt(0);
         }, "graceful-exit");
         t.setDaemon(false);

@@ -36,32 +36,41 @@ public final class FfmpegSupport {
     private static final long REAP_WAIT_SEC = 5;
 
     static {
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            stopping = true;
-            int killed = 0;
-            for (Process p : LIVE) {
-                if (!p.isAlive()) continue;
-                try {
-                    p.destroyForcibly();
-                    killed++;
-                } catch (Exception ignored) {
-                    // 子进程已自行退出
-                }
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> reapNow(), "ffmpeg-reaper"));
+    }
+
+    /**
+     * 同步收掉所有登记在册、仍活着的子进程（ffmpeg / python 旁路 / ASR）。
+     *
+     * <p>既给 JVM 关闭钩子用，也给"容器关闭超时 → halt"这条路径**直接调用**：
+     * {@code Runtime.halt} 不会执行 shutdown hook，只挂钩子等于给退出留了个孤儿口子
+     * （实测一键停止后 douyu-danmu.py 还活着占着弹幕文件）。
+     */
+    public static void reapNow() {
+        stopping = true;
+        int killed = 0;
+        for (Process p : LIVE) {
+            if (!p.isAlive()) continue;
+            try {
+                p.destroyForcibly();
+                killed++;
+            } catch (Exception ignored) {
+                // 子进程已自行退出
             }
-            // 等终止送达：钩子线程活着，reaper 才有机会把 kill 落地
-            long deadline = System.currentTimeMillis() + REAP_WAIT_SEC * 1000L;
-            for (Process p : LIVE) {
-                long left = deadline - System.currentTimeMillis();
-                if (left <= 0) break;
-                try {
-                    p.waitFor(left, TimeUnit.SECONDS);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
+        }
+        // 等终止送达：调用线程活着，kill 才有机会落地
+        long deadline = System.currentTimeMillis() + REAP_WAIT_SEC * 1000L;
+        for (Process p : LIVE) {
+            long left = deadline - System.currentTimeMillis();
+            if (left <= 0) break;
+            try {
+                p.waitFor(left, TimeUnit.SECONDS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
             }
-            if (killed > 0) log.info("退出清理：强杀遗留子进程 {} 个", killed);
-        }, "ffmpeg-reaper"));
+        }
+        if (killed > 0) log.info("退出清理：强杀遗留子进程 {} 个", killed);
     }
 
     private FfmpegSupport() {

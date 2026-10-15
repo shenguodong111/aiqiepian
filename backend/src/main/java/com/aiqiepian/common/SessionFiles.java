@@ -41,4 +41,15 @@ public final class SessionFiles {
         List<File> segs = segmentsOf(fin);
         return segs.isEmpty() ? null : segs.get(segs.size() - 1);
     }
+
+    /**
+     * 该会话的弹幕采集文件（media 根目录下的 {@code {平台房间号}_{会话号}_danmaku.jsonl}）。
+     * 前缀是平台房间号、不是本项目的 room_id，所以只能按会话号后缀匹配。
+     */
+    public static List<File> danmakuFilesOf(File mediaDir, long sessionId) {
+        if (mediaDir == null || !mediaDir.isDirectory()) return List.of();
+        String suffix = "_" + sessionId + "_danmaku.jsonl";
+        File[] fs = mediaDir.listFiles((d, n) -> n.endsWith(suffix));
+        return fs == null || fs.length == 0 ? List.of() : Arrays.asList(fs);
+    }
 }

@@ -29,6 +29,8 @@ import java.util.List;
  *       → 一律打回 PENDING 重跑；RECORD 不动，由调度器按会话真实状态收尾。</li>
  *   <li>产物缺失补排：早期版本会提前把 job 写成 SUCCESS，中断后留下"DRAFT 作品 + SUCCESS 渲染 job"
  *       或"analyze_status 停在 RUNNING 的会话"，这些没有活跃 job 的按实体补排一次。</li>
+ *   <li>从未跑过的补排：analyze_status 一直是 NONE 的已结束会话（录制完了但那次没人排队），
+ *       开着自动运行时补排一次——否则它会永远躺着，界面表现就是"自动运行开着却什么都不产出"。</li>
  * </ul>
  *
  * <p>判定条件刻意收窄，避免误伤用户主动留着的草稿或反复重跑十几分钟的大文件：
@@ -41,6 +43,8 @@ public class PipelineRecovery implements ApplicationRunner {
 
     private static final Logger log = LoggerFactory.getLogger(PipelineRecovery.class);
     private static final int MAX_REQUEUE = 10;
+    /** 短于这个时长的录制不值得分析（最小的选段窗口都装不下） */
+    private static final int MIN_ANALYSABLE_SEC = 30;
 
     private final WorkMapper workMapper;
     private final RecordingSessionMapper sessionMapper;
@@ -54,6 +58,7 @@ public class PipelineRecovery implements ApplicationRunner {
         int quarantined = quarantineStalePublishJobs();
         int renders = requeueInterruptedRenders();
         int analyses = requeueInterruptedAnalyses();
+        int fresh = requeueNeverAnalysed();
         if (requeuedRows > 0) {
             log.info("启动回收上次进程遗留的重活僵尸行：打回队列重新执行 {} 个（ANALYZE/RENDER 仍标 RUNNING 但已无线程在跑）",
                     requeuedRows);
@@ -65,6 +70,9 @@ public class PipelineRecovery implements ApplicationRunner {
         if (renders > 0 || analyses > 0) {
             log.info("启动补排被中断的重活：成片渲染 {} 个、片段分析 {} 个（环节已标记完成但产物缺失）",
                     renders, analyses);
+        }
+        if (fresh > 0) {
+            log.info("启动补排从未分析过的已结束录制 {} 个（开着自动运行却一条都没跑，通常是录制时进程不在或历史遗留）", fresh);
         }
     }
 
@@ -144,5 +152,37 @@ public class PipelineRecovery implements ApplicationRunner {
             requeued++;
         }
         return requeued;
+    }
+
+    /**
+     * 从未排过队分析的已结束会话（analyze_status 停在 NONE）：自动补一次分析。
+     *
+     * <p>上面那条只捞"停在 RUNNING"的，于是"录制完成但一次都没分析过"的会话会永远躺在那里——
+     * 用户视角就是"自动运行明明开着，片段分析/剪辑/发布什么都没有"。分析完成会自动产出高光集锦，
+     * 剪辑与审片环节跟着动起来，所以这一条是把整条管线接上的关键一环。
+     *
+     * <p>刻意保守：总开关关着不补（那是用户明确要停）；文件不在的不补（素材库删过）；
+     * 录到不足 30 秒的不补（连最小选段窗口都装不下，跑了只产出垃圾片段）；一次最多 {@link #MAX_REQUEUE} 个。
+     */
+    private int requeueNeverAnalysed() {
+        if (!settings.getBool("auto_run", true)) return 0;
+        List<RecordingSession> rows = sessionMapper.selectList(Wrappers.<RecordingSession>lambdaQuery()
+                .eq(RecordingSession::getAnalyzeStatus, "NONE")
+                .ne(RecordingSession::getStatus, "RECORDING")
+                .isNotNull(RecordingSession::getFilePath)
+                .ge(RecordingSession::getRecordedSec, MIN_ANALYSABLE_SEC)
+                .orderByDesc(RecordingSession::getId));
+        int queued = 0;
+        for (RecordingSession s : rows) {
+            if (queued >= MAX_REQUEUE) break;
+            Long raw = s.getId();
+            if (raw == null) continue;
+            long id = raw;
+            if (s.getFilePath() == null || !java.nio.file.Files.exists(java.nio.file.Path.of(s.getFilePath()))) continue;
+            if (pipeline.activeJob("ANALYZE", "session", id) != null) continue;
+            pipeline.addJob("ANALYZE", "session", id);
+            queued++;
+        }
+        return queued;
     }
 }
