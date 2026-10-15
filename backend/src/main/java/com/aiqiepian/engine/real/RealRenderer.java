@@ -2,12 +2,14 @@ package com.aiqiepian.engine.real;
 
 import com.aiqiepian.entity.Clip;
 import com.aiqiepian.entity.CoverAsset;
+import com.aiqiepian.entity.LiveRoom;
 import com.aiqiepian.entity.RecordingSession;
 import com.aiqiepian.entity.Work;
 import com.aiqiepian.engine.Renderer;
 import com.aiqiepian.engine.model.RenderResult;
 import com.aiqiepian.mapper.ClipMapper;
 import com.aiqiepian.mapper.CoverAssetMapper;
+import com.aiqiepian.mapper.LiveRoomMapper;
 import com.aiqiepian.mapper.RecordingSessionMapper;
 import com.aiqiepian.service.SettingsService;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
@@ -24,10 +26,10 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 真实成片（M1）：对录制的 mp4 用 ffmpeg 剪切 clip（-ss/-t），叠加标题条
- * （drawtext + C:/Windows/Fonts/msyh.ttc），并生成封面。
- * 封面优先用房间配置的主播图片素材（CoverComposer 叠标题文字），未配置素材则截源视频帧再加字。
- * 降级链：drawtext 重编码失败 → 纯 -c copy 剪切 → 直接复制源文件，保证成片必出。
+ * 真实成片（M1）：对录制的 mp4 用 ffmpeg 剪切 clip（-ss/-t），画面**不叠任何标题文字**——
+ * 标题只出现在稿件封面上（CoverComposer 用 msyh.ttc 叠字），成片本体保持干净。
+ * 封面优先用房间配置的主播图片素材，未配置素材则截源视频帧再加字。
+ * 有 ASR 字幕时才重编码烧字幕，否则走 -c copy 无损剪切；再失败则整体复制源文件，保证成片必出。
  * 输出 media/works/work_{id}.mp4。
  */
 @Component
@@ -36,13 +38,13 @@ import java.util.List;
 public class RealRenderer implements Renderer {
 
     private static final Logger log = LoggerFactory.getLogger(RealRenderer.class);
-    /** ffmpeg filter 中 Windows 路径需转义冒号并加单引号保护：运行时值 fontfile='C\:/Windows/Fonts/msyh.ttc' */
-    private static final String FONT_FILE = "'C\\:/Windows/Fonts/msyh.ttc'";
 
     private final SettingsService settings;
     private final ClipMapper clipMapper;
     private final RecordingSessionMapper sessionMapper;
     private final CoverAssetMapper coverAssetMapper;
+    /** 只为取主播名当 ASR 热词（人名是同音错别字重灾区） */
+    private final LiveRoomMapper liveRoomMapper;
     private final AsrClient asr;
     private final CoverComposer coverComposer;
 
@@ -60,7 +62,7 @@ public class RealRenderer implements Renderer {
         // 高光集锦：作品自带多区间裁切清单则走 concat 拼接渲染，不落到单切片分支
         if (work.getReelSegments() != null && !work.getReelSegments().isBlank()) {
             File reelSource = existing(work.getSourcePath());
-            boolean reelOk = reelSource != null && renderReel(reelSource, work.getReelSegments(), out, work.getTitle());
+            boolean reelOk = reelSource != null && renderReel(reelSource, work.getReelSegments(), out);
             if (reelOk) {
                 // 封面取第一段高亮的中间点：从未烧字的原始录制取帧，文字统一交给 CoverComposer 叠
                 List<int[]> segs = parseSegments(work.getReelSegments());
@@ -96,20 +98,21 @@ public class RealRenderer implements Renderer {
         }
         if (dur < 1) dur = Math.min(1, Math.max(0.5, len));
 
-        // 字幕：仅当作品开启字幕且 ASR 可用时转写当前片段音频；失败/无数据 → sub=null，只保留标题条
+        // 字幕：作品开启字幕且 ASR 可用时转写当前片段音频（逐词对齐、按画面宽度折行都在 asr.py 里做）
+        String style = work.getSubtitleStyle() == null || work.getSubtitleStyle().isBlank()
+                ? "big" : work.getSubtitleStyle().trim().toLowerCase();
         File sub = null;
-        if (Boolean.TRUE.equals(work.getSubtitleEnabled()) && asr.enabled()) {
+        if (Boolean.TRUE.equals(work.getSubtitleEnabled()) && !"none".equals(style) && asr.enabled()) {
             Path srt = Path.of(dir, "subtitles", "work_" + work.getId() + ".srt");
-            sub = asr.transcribeSegment(source, start, dur, srt);
+            sub = asr.transcribeSegment(source, start, dur, srt, hotWords(work));
         }
 
-        boolean ok = renderWithTitleBar(source, out, work, start, dur, sub);
+        // 标题只叠在封面上，不烧进画面：没有字幕时连重编码都省了，直接无损剪切
+        boolean ok = sub == null
+                ? renderPureCopy(source, out, start, dur)
+                : renderWithSubtitles(source, out, start, dur, sub, style);
         if (!ok && sub != null) {
-            // 叠加字幕失败：退回去掉字幕的标题条渲染
-            ok = renderWithTitleBar(source, out, work, start, dur, null);
-        }
-        if (!ok) {
-            ok = renderPureCopy(source, out, start, dur);
+            ok = renderPureCopy(source, out, start, dur); // 字幕烧不上，至少把画面无损切出来
         }
         if (!ok) {
             ok = copyWhole(source, out);
@@ -184,42 +187,63 @@ public class RealRenderer implements Renderer {
         return f.isFile() && f.length() > 0 ? f : null;
     }
 
-    /** 首选：剪切 + drawtext 标题条（可选叠加 ASR 字幕）（重编码） */
-    private boolean renderWithTitleBar(File source, Path out, Work work, double start, double dur, File sub) {
-        String title = work.getTitle() == null || work.getTitle().isBlank()
-                ? (work.getRoomName() == null ? "精彩片段" : work.getRoomName())
-                : work.getTitle();
-        StringBuilder vf = new StringBuilder("drawtext=fontfile=" + FONT_FILE
-                + ":text='" + FfmpegSupport.escapeFilterValue(title) + "'"
-                + ":fontsize=42:fontcolor=white:borderw=3:bordercolor=black"
-                + ":box=1:boxcolor=black@0.45:boxborderw=18"
-                + ":x=(w-text_w)/2:y=h*0.08");
-        if (sub != null) {
-            // libass 烧录字幕：路径反斜杠转斜杠、冒号转义并单引号保护；force_style 用中文字体、底部居中
-            String sp = sub.getAbsolutePath().replace("\\", "/").replace(":", "\\:");
-            vf.append(",subtitles=filename='").append(sp).append("'")
-                    .append(":force_style='FontName=Microsoft YaHei,FontSize=15,PrimaryColour=&H00FFFFFF,")
-                    .append("OutlineColour=&H80000000,BorderStyle=1,Outline=1,Shadow=0,Bold=0,MarginV=28,Alignment=2'");
-        }
+    /** 只有需要烧字幕时才走这条重编码路径（画面本身不再叠任何标题文字） */
+    private boolean renderWithSubtitles(File source, Path out, double start, double dur, File sub, String style) {
+        // libass 烧录字幕：路径反斜杠转斜杠、冒号转义并单引号保护；样式由作品的 subtitle_style 决定
+        String sp = sub.getAbsolutePath().replace("\\", "/").replace(":", "\\:");
+        String vf = "subtitles=filename='" + sp + "':force_style='" + forceStyle(style) + "'";
         List<String> cmd = new ArrayList<>(List.of(
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
                 "-ss", fmt(start), "-i", source.getAbsolutePath(),
                 "-t", fmt(dur),
-                "-vf", vf.toString(),
+                "-vf", vf,
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                 "-c:a", "aac", "-movflags", "+faststart",
                 "-y", out.toString()));
         StringBuilder err = new StringBuilder();
         int code = FfmpegSupport.run(cmd, 600, err);
         if (code != 0 || !outIsGood(out)) {
-            log.warn("drawtext{}成片失败(exit={})，将降级。ffmpeg 输出: {}",
-                    sub != null ? "+字幕" : "", code, err);
+            log.warn("字幕烧录成片失败(exit={})，将降级。ffmpeg 输出: {}", code, err);
             return false;
         }
         return true;
     }
 
-    /** 降级 1：不叠加字体的流拷贝剪切 */
+    /**
+     * 字幕样式：编辑弹窗里那个下拉框必须真的改变画面，否则"选了没反应"比样式丑更让人不信任。
+     * FontSize 是 ASS 脚本单位（SRT 按 PlayResY=288 折算），asr.py 的每行字数上限就是照"大字"档算的。
+     */
+    static String forceStyle(String style) {
+        String font = "FontName=Microsoft YaHei,PrimaryColour=&H00FFFFFF,BorderStyle=1,Shadow=0,"
+                + "MarginL=40,MarginR=40,MarginV=30,Alignment=2,";
+        if ("outline".equals(style)) {
+            return font + "FontSize=15,OutlineColour=&H80000000,Outline=3,Bold=0";
+        }
+        return font + "FontSize=19,OutlineColour=&H90000000,Outline=2,Bold=1";
+    }
+
+    /**
+     * ASR 热词：主播名 + 房间名 + 设置里的自定义术语。
+     * 人名和英雄/技能名是同音错别字的重灾区，解码前喂给 whisper 比事后校对靠谱得多。
+     */
+    String hotWords(Work work) {
+        List<String> parts = new ArrayList<>();
+        try {
+            LiveRoom room = work.getRoomId() == null ? null : liveRoomMapper.selectById(work.getRoomId());
+            if (room != null && room.getAnchorName() != null && !room.getAnchorName().isBlank()) {
+                parts.add(room.getAnchorName().trim());
+            }
+        } catch (Exception e) {
+            log.debug("房间主播名查询失败（忽略，热词少一个而已）: {}", e.toString());
+        }
+        if (work.getRoomName() != null && !work.getRoomName().isBlank()) parts.add(work.getRoomName().trim());
+        String custom = settings.getStr("asr_hotwords", "").trim();
+        if (!custom.isEmpty()) parts.add(custom);
+        String joined = String.join(",", parts);
+        return joined.length() > 160 ? joined.substring(0, 160) : joined;
+    }
+
+    /** 首选（无字幕）：不叠加任何字体的流拷贝剪切 */
     private boolean renderPureCopy(File source, Path out, double start, double dur) {
         List<String> cmd = List.of("ffmpeg", "-hide_banner", "-loglevel", "error",
                 "-ss", fmt(start), "-i", source.getAbsolutePath(),
@@ -333,11 +357,10 @@ public class RealRenderer implements Renderer {
 
     /**
      * 高光集锦：从同一原片按多个 [start,end]（秒）区间裁切，用 filter_complex trim+concat
-     * 一次拼接成一支成片，并叠加标题条。单次编码，避免逐段产物再合并。
-     * 封面由调用方在成功后另行生成（要从未烧字的源片取帧）。
+     * 一次拼接成一支成片。画面不叠标题，封面由调用方在成功后另行生成（标题只出现在封面上）。
      * segments 格式 "start,end;start,end"。任何失败返回 false（调用方保持占位输出）。
      */
-    private boolean renderReel(File source, String segments, Path out, String title) {
+    private boolean renderReel(File source, String segments, Path out) {
         if (source == null || segments == null || segments.isBlank()) return false;
         List<int[]> segs = parseSegments(segments);
         if (segs.isEmpty()) return false;
@@ -348,18 +371,21 @@ public class RealRenderer implements Renderer {
             return false;
         }
         double srcLen = FfmpegSupport.probeDuration(source);
-        if (renderReelSeekCut(source, segs, srcLen, out, title)) return true;
-        return renderReelFilterComplex(source, segs, srcLen, out, title);
+        if (renderReelSeekCut(source, segs, srcLen, out)) return true;
+        return renderReelFilterComplex(source, segs, srcLen, out);
     }
 
     /**
-     * 快速路径：逐段把 `-ss` 放在 `-i` 前面（输入端定位，只解码这一段），加标题条后编成参数完全一致的
+     * 快速路径：逐段把 `-ss` 放在 `-i` 前面（输入端定位，只解码这一段），编成参数完全一致的
      * 临时片，再用 concat demuxer 无损拼接。
      *
      * <p>老路径的 trim 滤镜是在解码之后才裁切，所以哪怕只取一小时录制里的十分钟高光，ffmpeg 也要从
      * 第 0 秒解到最后一段的结尾。任一段失败、拼接产物异常或时长对不上，都返回 false 回退老路径。
+     *
+     * <p>重编码不是为了叠字（画面一律不加标题），而是把各段统一成同一种编码参数，
+     * 后面的 {@code -c copy} 拼接才不会在花字/时长上出问题。
      */
-    private boolean renderReelSeekCut(File source, List<int[]> segs, double srcLen, Path out, String title) {
+    private boolean renderReelSeekCut(File source, List<int[]> segs, double srcLen, Path out) {
         String base = out.getFileName().toString().replaceAll("\\.[^.]+$", "");
         Path tmpDir = out.getParent().resolve("reel_tmp");
         List<Path> temps = new ArrayList<>();
@@ -367,7 +393,6 @@ public class RealRenderer implements Renderer {
         double expected = 0;
         try {
             Files.createDirectories(tmpDir);
-            String draw = drawTextFilter(title);
             int idx = 0;
             for (int[] seg : segs) {
                 double s = Math.max(0, seg[0]);
@@ -378,9 +403,7 @@ public class RealRenderer implements Renderer {
                 Path segFile = tmpDir.resolve(base + "_seg" + idx + ".mp4");
                 List<String> cmd = new ArrayList<>(List.of(
                         "ffmpeg", "-hide_banner", "-loglevel", "error",
-                        "-ss", fmt(s), "-i", source.getAbsolutePath(), "-t", fmt(d)));
-                if (!draw.isEmpty()) cmd.addAll(List.of("-vf", draw));
-                cmd.addAll(List.of(
+                        "-ss", fmt(s), "-i", source.getAbsolutePath(), "-t", fmt(d),
                         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
                         "-c:a", "aac", "-ar", "44100", "-ac", "2",
                         "-y", segFile.toString()));
@@ -432,16 +455,6 @@ public class RealRenderer implements Renderer {
         }
     }
 
-    /** 标题条滤镜（不含前置输入标签）：title 为空则返回空串，表示不加字 */
-    private static String drawTextFilter(String title) {
-        if (title == null || title.isBlank()) return "";
-        return "drawtext=fontfile=" + FONT_FILE
-                + ":text='" + FfmpegSupport.escapeFilterValue(title) + "'"
-                + ":fontsize=42:fontcolor=white:borderw=3:bordercolor=black"
-                + ":box=1:boxcolor=black@0.45:boxborderw=18"
-                + ":x=(w-text_w)/2:y=h*0.08";
-    }
-
     private static void deleteQuietly(Path p) {
         try {
             Files.deleteIfExists(p);
@@ -450,7 +463,7 @@ public class RealRenderer implements Renderer {
     }
 
     /** 老路径：filter_complex trim+concat 单次拼接（要解码到最后一段的结尾，长录制明显更慢） */
-    private boolean renderReelFilterComplex(File source, List<int[]> segs, double srcLen, Path out, String title) {
+    private boolean renderReelFilterComplex(File source, List<int[]> segs, double srcLen, Path out) {
         StringBuilder fc = new StringBuilder();
         StringBuilder concatIn = new StringBuilder();
         int n = 0;
@@ -469,13 +482,7 @@ public class RealRenderer implements Renderer {
             n++;
         }
         if (n == 0) return false;
-        String safeTitle = title == null || title.isBlank() ? "高光集锦" : title;
-        fc.append(concatIn).append("concat=n=").append(n).append(":v=1:a=1[cv][ca];");
-        fc.append("[cv]drawtext=fontfile=").append(FONT_FILE)
-                .append(":text='").append(FfmpegSupport.escapeFilterValue(safeTitle)).append("'")
-                .append(":fontsize=42:fontcolor=white:borderw=3:bordercolor=black")
-                .append(":box=1:boxcolor=black@0.45:boxborderw=18")
-                .append(":x=(w-text_w)/2:y=h*0.08[outv]");
+        fc.append(concatIn).append("concat=n=").append(n).append(":v=1:a=1[outv][ca]");
 
         List<String> cmd = new ArrayList<>(List.of(
                 "ffmpeg", "-hide_banner", "-loglevel", "error",

@@ -268,8 +268,7 @@ onUnmounted(() => clearInterval(timer))
         </div>
         <div v-if="titleHint" class="hint" style="margin-top: 4px">{{ titleHint }}</div>
         <div v-if="editing.work.output_path" class="hint" style="margin-top: 4px">
-          改名会同步换封面文字；但<b>视频里烧录的标题条</b>是成片渲染那一刻定死的，
-          要让画面里的字也跟着改，请点「保存并重剪成片」。
+          改名只换<b>封面</b>文字；标题不再烧进画面，所以改完不必重剪成片。
         </div>
       </div>
       <label class="field"><span>简介</span><textarea class="input" v-model="editing.form.description" placeholder="支持 {房间} {日期} 等变量文案"></textarea></label>

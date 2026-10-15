@@ -459,7 +459,7 @@ public class PipelineServiceImpl implements PipelineService {
         workMapper.updateById(w);
 
         addJob("RENDER", "work", w.getId());
-        // 标题/简介的大模型精修放在渲染前做（见 renderDone）：标题条要烧进画面，必须先定稿
+        // 标题/简介的大模型精修放在渲染前做（见 renderDone）：封面合成在渲染里，标题必须先定稿
         log.info("高光集锦作品已创建 work={} 段={} 预计={}s（目标 {}s，录制 {}s）",
                 w.getId(), chosen.size(), acc, target, recorded);
     }
@@ -574,7 +574,7 @@ public class PipelineServiceImpl implements PipelineService {
     /**
      * ai_mode=local 时用大模型精修标题 + 生成投稿简介，只定向更新 title/description（不碰状态/产物）。
      *
-     * <p>必须在渲染<b>之前</p>跑完：标题条是烧进画面里的，渲染完就再也改不动了。过去这一句挂在
+     * <p>必须在渲染<b>之前</p>跑完：封面文字是渲染时叠上去的，标题晚改就成了两套。过去这一句挂在
      * 建作品之后异步执行，渲染几分钟里谁先谁后全凭运气，实测就出现过「视频里烧的是规则标题、
      * 稿件标题却是大模型标题」的两套标题。人工改过标题的作品（title_edited）不再精修，
      * 免得把用户定的名字换回去。

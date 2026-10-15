@@ -238,7 +238,10 @@ public class RealRecorder implements Recorder {
                 "-y", outFile.getAbsolutePath()));
         ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.redirectErrorStream(true);
-        Process p = pb.start();
+        // 必须登记在册：这里是全工程唯一一处裸 pb.start()，进程没进登记表，
+        // 应用退出时钩子杀不到它——实测留下两个孤儿 ffmpeg 在已结束会话上继续写了几 GB 盘，
+        // 而且文件被它们占着，启动时的遗留分片收尾（改名合并）因共享冲突失败，素材分析不出来。
+        Process p = FfmpegSupport.startOwned(pb);
         if (sharedTail != null) {
             FfmpegSupport.consumeOutputTo(p, sharedTail, 30);
         } else {

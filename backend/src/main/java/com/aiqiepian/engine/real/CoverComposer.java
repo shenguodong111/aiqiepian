@@ -37,8 +37,8 @@ public class CoverComposer {
     }
 
     /**
-     * 视频截帧 + 标题。ss 应取未烧字的原始录制，而不是成片——
-     * 成片已叠了标题条，再叠一次封面文字会重影。
+     * 视频截帧 + 标题。ss 取未重编码的原始录制：那里的画面就是主播当时的画面，
+     * 集锦成片可能正好切在黑帧/转场上。标题文字只叠在封面上，成片本体不叠。
      */
     public boolean fromFrame(File video, double ss, String title, Path out) {
         if (video == null || !video.isFile() || video.length() == 0) return false;

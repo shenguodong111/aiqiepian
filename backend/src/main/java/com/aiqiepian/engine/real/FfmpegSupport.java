@@ -154,6 +154,37 @@ public final class FfmpegSupport {
         }
     }
 
+    /**
+     * ffprobe 取视频画面宽高（字幕折行要按真实画面宽度算每行字数）。
+     *
+     * @return {宽, 高}；探测失败返回 {0, 0}
+     */
+    public static int[] probeSize(File file) {
+        List<String> cmd = List.of("ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "default=noprint_wrappers=1",
+                file.getAbsolutePath());
+        StringBuilder out = new StringBuilder();
+        if (runCapturing(cmd, 30, out) != 0) return new int[]{0, 0};
+        int w = 0;
+        int h = 0;
+        for (String line : out.toString().split("\\R")) {
+            String s = line.trim();
+            if (s.startsWith("width=")) w = parseDim(s.substring(6));
+            else if (s.startsWith("height=")) h = parseDim(s.substring(7));
+        }
+        return new int[]{w, h};
+    }
+
+    private static int parseDim(String raw) {
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
     /** 消费进程输出到环形缓冲（守护线程），进程退出后可读取尾部日志；防 stdout/stderr 管道阻塞 */
     public static LinkedList<String> consumeOutput(Process p, int maxLines) {
         LinkedList<String> ring = new LinkedList<>();

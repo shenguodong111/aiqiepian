@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * 本地语音 ASR（faster-whisper）：把录制片段的音频转成 SRT 字幕，供 {@link RealRenderer} 烧录。
  * 通过 ProcessBuilder 调用 {@code scripts/asr.py}，Java 侧只负责抽音频 + 落 SRT。
- * 全部可降级：未开启 / 探活失败 / python 或模型缺失 / 转写失败 → 返回 null，渲染只保留标题条。
+ * 全部可降级：未开启 / 探活失败 / python 或模型缺失 / 转写失败 → 返回 null，成片照常出不带字幕。
  */
 @Component
 @RequiredArgsConstructor
@@ -81,7 +81,7 @@ public class AsrClient {
             }
             if (!Boolean.TRUE.equals(availableCache)) {
                 availableCache = false;
-                log.warn("未找到可用的 ASR 解释器（需在设置页填 asr_python，或让 PATH 上的 python 装上 faster-whisper）；渲染将只保留标题条");
+                log.warn("未找到可用的 ASR 解释器（需在设置页填 asr_python，或让 PATH 上的 python 装上 faster-whisper）；成片将不带字幕");
             }
             probeKey = cfg;
         }
@@ -90,9 +90,13 @@ public class AsrClient {
     /**
      * 转写源文件 [start, start+dur] 这段音频为 SRT（时间轴相对切点后 0 起点）。
      *
+     * <p>逐词时间轴、按标点重切、每行字数上限都在 asr.py 里做；这里只把两件事告诉它：
+     * 画面真实宽高（决定一行塞几个字）和热词（主播名/房间名/术语，专治同音错别字）。
+     *
+     * @param hotwords 逗号分隔的热词，可为 null
      * @return 生成成功的 SRT 文件；任何前置条件不满足或失败返回 null
      */
-    public File transcribeSegment(File source, double start, double dur, Path srtPath) {
+    public File transcribeSegment(File source, double start, double dur, Path srtPath, String hotwords) {
         if (!available() || source == null || dur < 0.5) return null;
         Path wav = srtPath.resolveSibling(
                 srtPath.getFileName().toString().replaceFirst("\\.srt$", "") + ".wav");
@@ -110,13 +114,14 @@ public class AsrClient {
             StringBuilder exErr = new StringBuilder();
             int exCode = FfmpegSupport.run(extract, 120, exErr);
             if (exCode != 0 || !nonEmpty(wav)) {
-                log.warn("ASR 抽音频失败(exit={})，仅标题条。ffmpeg: {}", exCode, exErr.toString().trim());
+                log.warn("ASR 抽音频失败(exit={})，成片不带字幕。ffmpeg: {}", exCode, exErr.toString().trim());
                 return null;
             }
 
             // 2) python 转写 → SRT
             String py = workingPython();
             String script = settings.getStr("asr_script", defaultScript());
+            int[] size = FfmpegSupport.probeSize(source);   // 字幕折行按真实画面宽度算
             List<String> cmd = new ArrayList<>(List.of(
                     py, script,
                     "--input", wav.toString(),
@@ -124,7 +129,12 @@ public class AsrClient {
                     "--model", settings.getStr("asr_model", "small"),
                     "--language", settings.getStr("asr_language", "zh"),
                     "--device", settings.getStr("asr_device", "cpu"),
-                    "--compute", settings.getStr("asr_compute", "int8")));
+                    "--compute", settings.getStr("asr_compute", "int8"),
+                    "--width", String.valueOf(size[0]),
+                    "--height", String.valueOf(size[1])));
+            if (hotwords != null && !hotwords.isBlank()) {
+                cmd.addAll(List.of("--hotwords", hotwords.trim()));
+            }
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.redirectErrorStream(true);
             // 模型已在本地缓存：强制离线，避免运行时联网校验 hub 失败；中文按 UTF-8 读写
@@ -151,7 +161,7 @@ public class AsrClient {
             try {
                 if (!p.waitFor(ASR_TIMEOUT_SEC, TimeUnit.SECONDS)) {
                     p.destroyForcibly();
-                    log.warn("ASR 转写超时(>{}s)，仅标题条", ASR_TIMEOUT_SEC);
+                    log.warn("ASR 转写超时(>{}s)，成片不带字幕", ASR_TIMEOUT_SEC);
                     return null;
                 }
             } finally {
@@ -161,14 +171,14 @@ public class AsrClient {
             boolean ok = code == 0 && nonEmpty(srtPath);
             if (!ok) {
                 synchronized (out) {
-                    log.warn("ASR 转写失败(exit={})，仅标题条。python 输出: {}", code, out.toString().trim());
+                    log.warn("ASR 转写失败(exit={})，成片不带字幕。python 输出: {}", code, out.toString().trim());
                 }
                 return null;
             }
             log.info("ASR 字幕已生成: {}", srtPath);
             return srtPath.toFile();
         } catch (Exception e) {
-            log.warn("ASR 异常，仅标题条: {}", e.toString());
+            log.warn("ASR 异常，成片不带字幕: {}", e.toString());
             return null;
         } finally {
             try {

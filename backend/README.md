@@ -10,27 +10,26 @@ API 契约与 `mock-server/server.mjs` 完全一致（snake_case JSON），前�
 | Java | 17 |
 | Spring Boot | 3.2.5 |
 | ORM | MyBatis-Plus 3.5.5（spring-boot3 starter） |
-| 数据库 | H2 文件库 `./data/aiqiepian.mv.db`（AUTO_SERVER=TRUE） |
-| 端口 | 8080（可 `-Dserver.port` 覆盖） |
-| CORS | 仅允许 `http://localhost:5173` |
+| 数据库 | H2 文件库 `./data/aiqiepian.mv.db`（AUTO_SERVER=TRUE）——**相对路径，工作目录决定用哪个库**，脚本启动时是 `backend/data/` |
+| 端口 | 8090（`--server.port` 覆盖），前端已内嵌进 jar，UI+API 同一进程 |
+| CORS | 仅允许 `http://localhost:5173`（只为 vite dev 保留） |
 
 ## 环境安装
 
-1. **JDK 17**：下载 Temurin 17（https://adoptium.net），安装后 `java -version` 应输出 17.x。
-2. **Maven 3.8+**：https://maven.apache.org/download.cgi，`mvn -v` 可正常输出且识别到 JDK 17。
+见根目录 [`README.md`](../README.md) 的「换一台电脑要装什么」：JDK 17 + ffmpeg 是必须，Maven/Node 只在打包时需要，ASR / 斗鱼弹幕 / 本地大模型三样按需。工具链位置由根目录 `env.bat` 自动探测，不要在本机脚本里写死绝对路径。
 
 ## 启动
 
 ```bash
-cd backend
-mvn spring-boot:run                       # http://localhost:8080/api/**
+# 开发：只起后端（真实引擎请带 --engine.mode=real）
+mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8090 --engine.mode=real"
 
 # 换端口（系统属性优先级高于 application.yml）
 mvn spring-boot:run -Dspring-boot.run.jvmArguments="-Dserver.port=8081"
 
-# 打包运行
+# 打包运行（注意：mvn package 不会重建前端，改过 .vue 请用根目录 build-package.bat）
 mvn clean package
-java -jar target/aiqiepian-backend-1.0.0.jar
+java -jar target/aiqiepian-backend-1.0.0.jar --server.port=8090 --engine.mode=real
 ```
 
 首次启动自动执行 `schema.sql` 建表（`CREATE TABLE IF NOT EXISTS`，幂等），并向 `app_setting`
@@ -49,15 +48,9 @@ cd frontend && npm install && npm run dev   # http://localhost:5173（vite 代�
 
 ## 引擎模式：mock ↔ 真实
 
-- 当前所有引擎为 `engine/mock/` 下的 Mock 实现，条件装配：
-  `@ConditionalOnProperty(name = "engine.mode", havingValue = "mock", matchIfMissing = true)`。
-- 切换真实引擎（M1–M3）：
-  1. 实现 `StreamMonitor / Recorder / Analyzer / Renderer / Reviewer / Publisher`（接口见需求文档 §7）；
-  2. 标注 `@ConditionalOnProperty(name = "engine.mode", havingValue = "real")` 并注册为 Bean；
-  3. `application.yml` 改 `engine.mode: real`（或 `-Dengine.mode=real`）。
-  **controller / service / 前端零改动。**
-- 注意：job 进度推进与 4% 模拟失败目前内嵌在 `PipelineOrchestrator` 的 mock 节奏中
-  （对照 server.mjs tick）；真实引擎接入时由引擎自行上报进度。
+- 两套实现并存，按启动参数条件装配：mock 为 `@ConditionalOnProperty(name = "engine.mode", havingValue = "mock", matchIfMissing = true)`，真实实现见 `engine/real/`（`RealStreamMonitor` / `RealRecorder` / `RealAnalyzer` / `RealRenderer` / `RealPublisher` …），`--engine.mode=real` 即整体切换，**controller / service / 前端零改动**。
+- 平台支持范围以代码为准：可录平台判断在 `RealRecorder.supportsRealRecording()`（当前 B站 / 斗鱼 / 虎牙），开播检测在 `RealStreamMonitor`，弹幕通道在 `DanmakuCollector`（B站 Java TCP、斗鱼本机 Python 旁路、虎牙暂无实现）。
+- mock 的进度推进与 4% 模拟失败仍内嵌在 `PipelineOrchestrator` 的 tick 里（对照 server.mjs）；真实引擎由引擎自行上报进度。
 
 ## 与 mock-server 的差异说明
 
