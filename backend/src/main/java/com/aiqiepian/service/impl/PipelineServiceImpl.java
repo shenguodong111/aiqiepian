@@ -505,14 +505,23 @@ public class PipelineServiceImpl implements PipelineService {
 
     @Override
     public void renderDone(Work w) {
-        w.setStatus("READY");
-        w.setUpdatedAt(LocalDateTime.now());
         String out = renderer.render(w).getOutputPath();
-        w.setOutputPath(out);
         // 实测成片长度：集锦由多段拼成，界面若拿单片段时长显示会严重偏小（实测 420s 的集锦显示成 1 分钟）
         int dur = renderer.probeDurationSec(out);
+        LocalDateTime now = LocalDateTime.now();
+        // 只写自己这几列，别用 updateById 回写整行：渲染要吃掉几分钟，这期间 enrichWorkAsync
+        // 可能已经把标题/简介换成大模型版本，拿渲染前读到的旧快照整行覆盖就会把精修结果打回
+        // 规则标题（实测发出去的稿件标题退成了"主播 决胜时刻名场面"）。
+        workMapper.update(null, Wrappers.<Work>lambdaUpdate()
+                .eq(Work::getId, w.getId())
+                .set(Work::getStatus, "READY")
+                .set(Work::getUpdatedAt, now)
+                .set(Work::getOutputPath, out)
+                .set(dur > 0, Work::getDurationSec, dur));
+        w.setStatus("READY");
+        w.setUpdatedAt(now);
+        w.setOutputPath(out);
         if (dur > 0) w.setDurationSec(dur);
-        workMapper.updateById(w);
         addJob("REVIEW", "work", w.getId());
     }
 
