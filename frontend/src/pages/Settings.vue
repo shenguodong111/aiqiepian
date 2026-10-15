@@ -56,6 +56,7 @@ const form = reactive({
   asr_model: 'small',
   asr_language: 'zh',
   asr_python: '',
+  danmu_python: '',
   media_dir: './media',
   keep_days: 30,
   publish_default_tags: '',
@@ -274,6 +275,14 @@ onUnmounted(stopQrPoll)
           </div>
           <label class="field"><span>Python 解释器（可选）</span><input class="input" v-model="form.asr_python" placeholder="留空 = 自动探测 PATH 上的 python / py" /></label>
           <p class="hint">需要本机装有 faster-whisper。留空时程序会自己试 python、py 两个命令；装在别处就填完整的 python.exe 路径。</p>
+        </div>
+
+        <!-- 斗鱼弹幕通道 -->
+        <div class="card group">
+          <div class="group-title">斗鱼弹幕通道 <span class="badge cyan" style="margin-left: 8px">自动</span></div>
+          <p class="hint">斗鱼起录时会自动实时采集弹幕，用来给候选片段算热度、填「弹幕条数 / 每分钟 / 峰值 / 发言人数 / 高频弹幕」并在 AI 理由里指出"弹幕互动活跃"。需要本机 Python 装一个包：<code>python -m pip install websocket-client</code>。</p>
+          <label class="field"><span>Python 解释器（可选）</span><input class="input" v-model="form.danmu_python" placeholder="留空 = 复用上面的 ASR 解释器，再留空则自动探测 PATH 上的 python / py" /></label>
+          <p class="hint">采不到就静默降级（日志写一句原因），录制、分析、成片照常跑，选段退回"语音 + 画面"判定。B 站弹幕仍走登录 Cookie，虎牙暂不采集。</p>
         </div>
 
         <!-- 高光集锦自动成片 -->

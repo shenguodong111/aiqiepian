@@ -50,12 +50,29 @@ public class SystemController {
             } catch (Exception e) {
                 log.warn("退出前收尾录制异常: {}", e.toString());
             }
+            // 容器关闭必须有上限。实测卡点：页面里正在播放媒体流时，Tomcat 的 graceful close
+            // 会一直等在途请求上，SpringApplication.exit 永不返回——进程看似"点了停止但没停"，
+            // 还继续锁着 jar 文件，下一次打包就会失败（Unable to rename ...jar.original）。
+            Thread closer = new Thread(() -> {
+                try {
+                    SpringApplication.exit(context, () -> 0);
+                } catch (Exception e) {
+                    log.warn("Spring 容器关闭异常: {}", e.toString());
+                }
+            }, "graceful-context-close");
+            closer.setDaemon(true);
+            closer.start();
             try {
-                SpringApplication.exit(context, () -> 0);
-            } catch (Exception e) {
-                log.warn("Spring 容器关闭异常，仍继续退出 JVM: {}", e.toString(), e);
+                closer.join(15_000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
             }
-            System.exit(0);
+            if (closer.isAlive()) {
+                log.warn("容器关闭 15 秒未完成（通常是页面还挂着媒体流/长连接），强制退出 JVM；"
+                        + "录制已在前面收尾，ffmpeg 闸也已关，不会有孤儿进程");
+            }
+            // halt 不再跑 shutdown hook：上面已经做过录制收尾，这里要的是"一定退得掉"
+            Runtime.getRuntime().halt(0);
         }, "graceful-exit");
         t.setDaemon(false);
         t.start();

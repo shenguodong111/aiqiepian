@@ -26,6 +26,8 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.zip.Inflater;
@@ -64,6 +66,10 @@ public class DanmakuCollector {
         volatile java.io.OutputStream out;
         ScheduledExecutorService heartbeat;
         ScheduledFuture<?> future;
+        /** 斗鱼通道：Python 旁路子进程 */
+        volatile Process sidecar;
+        /** 由 end() 主动停止（录制结束/一键停止），用来把"我们关的"和"它自己崩的"区分开 */
+        volatile boolean stopping;
 
         Session(Path outFile) {
             this.outFile = outFile;
@@ -74,11 +80,33 @@ public class DanmakuCollector {
     private final Map<Long, Session> active = new ConcurrentHashMap<>();
 
     /**
-     * 录制开始时挂接：Cookie 齐全则异步起 WS 采集线程；任何条件不满足直接返回（静默降级）。
+     * 录制开始时挂接（B 站通道，保持旧签名）。
      * 由 RealRecorder.start 调用，绝不向调用方抛异常。
      */
     public void begin(String biliRoomId, long sessionId) {
+        begin(biliRoomId, sessionId, "bilibili");
+    }
+
+    /**
+     * 按平台分发弹幕通道。落盘文件名一律 `{roomId}_{sessionId}_danmaku.jsonl`，
+     * 行格式一律 `{"ts","uid","text"}`——分析侧（RealAnalyzer）只认这个文件名与字段，
+     * 与平台无关，所以新增平台只需要多一条采集支路，选段评分/弹幕统计列/高频弹幕全部自动生效。
+     *
+     * <p>斗鱼走 Python 旁路子进程：danmuproxy 的 8501-8506 只接受**静态 RSA 密钥交换**的
+     * TLS1.2 套件（实测 ECDHE 一律被服务器 handshake_failure 拒绝），而 JDK17 的 SunJSSE
+     * 支持的套件里 TLS_RSA_WITH_* 数量为 0，纯 Java 无法完成握手；Python 侧 OpenSSL 可正常协商。
+     */
+    public void begin(String roomId, long sessionId, String platform) {
         try {
+            String plat = platform == null ? "bilibili" : platform.trim().toLowerCase();
+            if ("douyu".equals(plat)) {
+                startDouyuSidecar(roomId, sessionId);
+                return;
+            }
+            if ("huya".equals(plat)) {
+                log.info("弹幕增强通道未启用：虎牙暂无采集实现（纯音频/画面分析照常）room={}", roomId);
+                return;
+            }
             // 优先使用完整浏览器 Cookie（含已激活的 buvid3/b_nut 指纹，可过 -352 风控）；否则回退登录三件套
             String full = settings.getStr("bili_browser_cookie", "");
             String sessdata = settings.getStr("bili_sessdata", "");
@@ -94,13 +122,10 @@ public class DanmakuCollector {
                 return;
             }
             String uidForWs = uid.isBlank() ? "0" : uid;
-            Path dir = Path.of(settings.getStr("media_dir", "./media"));
-            Files.createDirectories(dir);
-            Path out = dir.resolve(biliRoomId + "_" + sessionId + "_danmaku.jsonl");
-            Files.deleteIfExists(out);
+            Path out = prepareOutFile(roomId, sessionId);
             Session s = new Session(out);
             active.put(sessionId, s);
-            Thread t = new Thread(() -> run(biliRoomId, uidForWs, cookie, s, sessionId),
+            Thread t = new Thread(() -> run(roomId, uidForWs, cookie, s, sessionId),
                     "danmaku-collect-" + sessionId);
             t.setDaemon(true);
             t.start();
@@ -109,7 +134,108 @@ public class DanmakuCollector {
         }
     }
 
-    /** 录制结束时关闭：停止心跳、关闭 WS。由 RealRecorder.stop 调用，绝不抛异常。 */
+    private Path prepareOutFile(String roomId, long sessionId) throws Exception {
+        Path dir = Path.of(settings.getStr("media_dir", "./media"));
+        Files.createDirectories(dir);
+        Path out = dir.resolve(roomId + "_" + sessionId + "_danmaku.jsonl");
+        Files.deleteIfExists(out);
+        return out;
+    }
+
+    /** 斗鱼：起 scripts/douyu-danmu.py 旁路子进程，逐行写同一份 jsonl */
+    private void startDouyuSidecar(String roomId, long sessionId) throws Exception {
+        String py = douyuPython();
+        if (py == null) {
+            log.info("斗鱼弹幕通道未启用：找不到能 import websocket 的 python"
+                    + "（装法：pip install websocket-client；纯音频/画面分析照常）");
+            return;
+        }
+        Path out = prepareOutFile(roomId, sessionId);
+        String script = settings.getStr("douyu_danmu_script", defaultDanmuScript());
+        if (!Files.exists(Path.of(script))) {
+            log.warn("斗鱼弹幕通道未启用：找不到采集脚本 {}", script);
+            return;
+        }
+        ProcessBuilder pb = new ProcessBuilder(py, script, "--room", roomId, "--out", out.toString());
+        pb.redirectErrorStream(true);
+        pb.directory(new java.io.File(System.getProperty("user.dir")));
+        Process p = pb.start();
+        Session s = new Session(out);
+        s.sidecar = p;
+        active.put(sessionId, s);
+        Thread pump = new Thread(() -> pumpSidecar(p, sessionId, roomId, s), "danmaku-sidecar-" + sessionId);
+        pump.setDaemon(true);
+        pump.start();
+        log.info("斗鱼弹幕采集已启动 room={} session={} python={} script={}", roomId, sessionId, py, script);
+    }
+
+    /** 旁路进程日志只转述协议层信息（连接/协议错误/退出码），弹幕正文不进后端日志 */
+    private void pumpSidecar(Process p, long sessionId, String roomId, Session self) {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                String t = line.trim();
+                if (t.isEmpty()) continue;
+                if (t.startsWith("[warn]") || t.startsWith("[RESULT]")) {
+                    log.info("斗鱼弹幕[{}] {}", roomId, t);
+                } else {
+                    log.debug("斗鱼弹幕[{}] {}", roomId, t);
+                }
+            }
+            int code = p.waitFor();
+            if (self.stopping) {
+                log.info("斗鱼弹幕采集已随录制结束 session={} room={}", sessionId, roomId);
+            } else {
+                log.info("斗鱼弹幕采集结束 session={} room={} exit={}（旁路进程自行退出，采集期间弹幕可能不完整）",
+                        sessionId, roomId, code);
+            }
+        } catch (Exception e) {
+            log.debug("斗鱼弹幕旁路日志读取结束（session={}）: {}", sessionId, e.toString());
+        } finally {
+            active.remove(sessionId);
+        }
+    }
+
+    /** 能 import websocket 的解释器：设置项优先，其次 asr_python、PATH 上的 python/py；结果缓存 */
+    private volatile String danmuPythonCache;
+    private volatile String danmuPythonKey;
+
+    private String douyuPython() {
+        String cfg = settings.getStr("danmu_python", "").trim();
+        if (cfg.isEmpty()) cfg = settings.getStr("asr_python", "").trim();
+        if (cfg.equals(danmuPythonKey)) return danmuPythonCache;
+        synchronized (this) {
+            if (cfg.equals(danmuPythonKey)) return danmuPythonCache;
+            String found = null;
+            List<String> candidates = new ArrayList<>();
+            if (!cfg.isEmpty()) candidates.add(cfg);
+            candidates.add("python");
+            candidates.add("py");
+            for (String cand : candidates) {
+                StringBuilder err = new StringBuilder();
+                int code = FfmpegSupport.run(List.of(cand, "-c", "import websocket"), 60, err);
+                if (code == 0) {
+                    found = cand;
+                    break;
+                }
+            }
+            danmuPythonCache = found;
+            danmuPythonKey = cfg;
+            return found;
+        }
+    }
+
+    /** 工作目录为 backend/ 时向上一级取仓库根，否则就地拼 scripts/douyu-danmu.py */
+    private String defaultDanmuScript() {
+        java.nio.file.Path root = Path.of("").toAbsolutePath();
+        if (root.getFileName() != null && "backend".equals(root.getFileName().toString())) {
+            root = root.getParent();
+        }
+        return root.resolve("scripts").resolve("douyu-danmu.py").toString();
+    }
+
+    /** 录制结束时关闭：停止心跳、关闭 WS、回收旁路子进程。由 RealRecorder.stop 调用，绝不抛异常。 */
     public void end(long sessionId) {
         Session s = active.remove(sessionId);
         if (s == null) return;
@@ -117,6 +243,11 @@ public class DanmakuCollector {
             if (s.future != null) s.future.cancel(true);
             if (s.heartbeat != null) s.heartbeat.shutdownNow();
             if (s.sock != null) s.sock.close();
+            if (s.sidecar != null && s.sidecar.isAlive()) {
+                s.stopping = true;
+                s.sidecar.destroy();
+                if (!s.sidecar.waitFor(3, TimeUnit.SECONDS)) s.sidecar.destroyForcibly();
+            }
         } catch (Exception e) {
             log.debug("弹幕采集关闭异常（忽略）: {}", e.toString());
         }

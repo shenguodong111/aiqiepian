@@ -99,6 +99,9 @@ public class SettingsServiceImpl implements SettingsService, ApplicationRunner {
         m.put("asr_language", "zh");
         m.put("asr_device", "cpu");
         m.put("asr_compute", "int8");
+        // ---- 斗鱼弹幕采集旁路（scripts/douyu-danmu.py，engine.mode=real 生效）----
+        // 留空 = 依次探测 danmu_python → asr_python → PATH 上的 python/py；判定标准是能 import websocket
+        m.put("danmu_python", "");
         m.put("publish_default_tags", "直播切片,AI剪辑");
         m.put("publish_desc_template", "{房间} {日期} 的精彩瞬间，由 AI 切片自动生成。");
         m.put("engine_mode", "mock");

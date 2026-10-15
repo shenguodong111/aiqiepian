@@ -40,6 +40,7 @@ const db = {
     asr_model: 'small',
     asr_language: 'zh',
     asr_python: '',
+    danmu_python: '',
     publish_default_tags: '直播切片,AI剪辑',
     publish_desc_template: '{房间} {日期} 的精彩瞬间，由 AI 切片自动生成。',
   },

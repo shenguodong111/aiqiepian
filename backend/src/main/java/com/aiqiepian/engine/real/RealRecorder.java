@@ -134,11 +134,6 @@ public class RealRecorder implements Recorder {
                 LinkedList<String> tail = FfmpegSupport.consumeOutput(p, 30);
                 handles.put(session.getId(), new Handle(p, Instant.now(), out, tail, false));
                 log.info("真实录制已启动(B站单进程) session={} room={} file={}", session.getId(), roomId, out);
-                try {
-                    danmakuCollector.begin(roomId, session.getId());
-                } catch (Exception de) {
-                    log.warn("弹幕采集挂接失败（降级为纯录制）: {}", de.toString());
-                }
             } else {
                 Handle h = new Handle(null, Instant.now(), out, new LinkedList<>(), true);
                 handles.put(session.getId(), h);
@@ -153,6 +148,13 @@ public class RealRecorder implements Recorder {
         } catch (Exception e) {
             handles.remove(session.getId());
             throw new BizException("启动 ffmpeg 录制失败: " + e.getMessage());
+        }
+        // 弹幕通道按平台分发（B站内置 WS / 斗鱼 Python 旁路 / 虎牙暂不采）。
+        // 放在录制启动之后、且不进上面的 try：采集挂接失败绝不能把一次正常录制判成失败。
+        try {
+            danmakuCollector.begin(roomId, session.getId(), platform);
+        } catch (Exception de) {
+            log.warn("弹幕采集挂接失败（降级为纯录制）: {}", de.toString());
         }
     }
 
