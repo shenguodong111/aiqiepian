@@ -1,8 +1,8 @@
 <script setup>
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { http } from '../api/http'
 import { toast } from '../utils/toast'
-import { store, loadSettings, setAutoRun } from '../stores/app'
+import { store, loadSettings } from '../stores/app'
 import { fmtBytes } from '../utils/format'
 import LoadingBlock from '../components/LoadingBlock.vue'
 import Modal from '../components/Modal.vue'
@@ -11,6 +11,9 @@ const loading = ref(true)
 const saving = ref(false)
 const resetModal = ref(false)
 const version = ref('v1.0.0-M0')
+// 总开关的唯一操作入口在侧栏底部；这里只读同一个 store 值显示状态，
+// 避免同一页出现两个"看起来都能拨"的开关，也避免保存表单时把别处刚改的值覆盖回去。
+const autoRun = computed(() => store.settings?.auto_run !== false)
 
 const cleanModal = ref(false)
 const cleaning = ref(false)
@@ -227,10 +230,10 @@ onUnmounted(stopQrPoll)
         <!-- 管线 -->
         <div class="card group">
           <div class="group-title">管线 <span class="hint" style="font-weight: 400">六环节调度参数</span></div>
-          <label class="check-line top-line">
-            <label class="switch"><input type="checkbox" :checked="!!store.settings?.auto_run" :disabled="!store.connected" @change="setAutoRun($event.target.checked)" /><span class="track"></span></label>
-            <span>自动运行总开关（关闭后不再产生新任务）<span class="hint" style="font-weight: 400"> · 拨动即刻生效，与侧栏底部是同一个开关</span></span>
-          </label>
+          <div class="check-line top-line">
+            <span class="badge" :class="autoRun ? 'green' : 'orange'">{{ autoRun ? '运行中' : '已暂停' }}</span>
+            <span>自动运行总开关<span class="hint" style="font-weight: 400"> · 这里只显示状态，开关在左侧栏底部（关闭后不再产生新任务，拨动即刻生效）</span></span>
+          </div>
           <div class="form-2col">
             <label class="field"><span>监控轮询间隔（秒）</span><input class="input num" type="number" min="5" v-model.number="form.monitor_interval_sec" /></label>
             <label class="field"><span>失败自动重试次数</span><input class="input num" type="number" min="0" v-model.number="form.max_retry" /></label>
@@ -390,7 +393,7 @@ onUnmounted(stopQrPoll)
       </div>
 
       <div class="save-bar card">
-        <span class="hint">除「自动运行总开关」（拨动即刻生效）外，其余修改需点击保存后生效。</span>
+        <span class="hint">修改后需点击保存后生效；「自动运行总开关」的唯一开关在左侧栏底部，本页只显示它的状态。</span>
         <button class="btn primary" :disabled="saving" @click="save">{{ saving ? '保存中…' : '保存全部设置' }}</button>
       </div>
     </template>
