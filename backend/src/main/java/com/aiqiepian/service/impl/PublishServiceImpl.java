@@ -111,10 +111,8 @@ public class PublishServiceImpl implements PublishService {
         try {
             NavInfo n = bili.nav();
             if (!n.login()) {
-                // 校验不通过先试一次续期：B站网页端也在周期调同一个接口，能续上就不用用户重新登录
-                if (!refreshCookie().get("ok").equals(true)) {
-                    markCookieStatus("EXPIRED", "Cookie 无效：" + n.message());
-                }
+                // 校验不通过先试一次续期（refreshCookie 内部会自己重判 nav 并落体检状态）
+                refreshCookie();
                 n = bili.nav();
             }
             r.put("login", n.login());
@@ -176,6 +174,7 @@ public class PublishServiceImpl implements PublishService {
         if (!"confirmed".equals(p.status())) return r;
 
         bili.applyLoginCookies(p.cookies());
+        bili.saveRefreshToken(p.refreshToken());
         try {
             NavInfo n = bili.nav();
             if (n.login()) {
@@ -210,28 +209,41 @@ public class PublishServiceImpl implements PublishService {
             r.put("message", "尚未配置 Cookie，请直接扫码登录");
             return r;
         }
-        Map<String, String> ck = bili.refreshCookies();
-        if (ck.isEmpty()) {
-            markCookieStatus("EXPIRED", "续期未通过（会话已被 B 站作废）");
-            r.put("ok", false);
-            r.put("message", "续期失败：本次登录已被 B 站作废，请扫码重新登录");
-            return r;
+        BiliClient.RefreshResult res = bili.refreshSession();
+        if (res.outcome() == BiliClient.RefreshOutcome.ROTATED) {
+            bili.applyLoginCookies(res.cookies());
+            bili.saveRefreshToken(res.refreshToken());
         }
-        bili.applyLoginCookies(ck);
-        r.put("ok", true);
+        // 登录态结论只认 nav：续期接口报错 ≠ 会话失效。
+        // 2026-10-15 就是因为把 -400（请求格式问题）当成作废，把刚扫码登录的账号标成了「已过期·需重新扫码」。
+        NavInfo nav = null;
+        String navError = null;
         try {
-            NavInfo n = bili.nav();
-            if (n.login()) {
-                bind(n.uname());
-                markCookieStatus("VALID", "已续期：" + n.uname());
-                r.put("message", "已续期，登录态有效");
-                r.put("nickname", n.uname());
-            } else {
-                markCookieStatus("EXPIRED", "续期后仍未登录");
-                r.put("message", "续期后账号校验仍未通过，请扫码重新登录");
-            }
+            nav = bili.nav();
         } catch (BiliApiException e) {
-            r.put("message", "续期已写入但校验异常：" + e.getBiliMessage());
+            navError = e.getBiliMessage();
+        }
+        boolean login = nav != null && nav.login();
+        if (login) bind(nav.uname());
+
+        boolean rotated = res.outcome() == BiliClient.RefreshOutcome.ROTATED;
+        if (login) {
+            markCookieStatus("VALID", rotated ? "已续期：" + nav.uname() : "Cookie 有效：" + nav.uname());
+            // ok 的语义是「不用重新扫码」：B站判定还没到换 Cookie 的时候，同样算成功
+            r.put("ok", true);
+            r.put("rotated", rotated);
+            r.put("nickname", nav.uname());
+            r.put("message", rotated ? "已续期，登录态有效"
+                    : res.message() + "，当前登录态有效，无需重新扫码");
+        } else if (res.outcome() == BiliClient.RefreshOutcome.NOT_LOGGED_IN) {
+            markCookieStatus("EXPIRED", res.message());
+            r.put("ok", false);
+            r.put("message", "续期未通过（会话已被 B 站作废），请扫码重新登录");
+        } else {
+            markCookieStatus(navError == null ? "EXPIRED" : "UNKNOWN",
+                    (navError == null ? res.message() : "账号校验异常：" + navError));
+            r.put("ok", false);
+            r.put("message", (navError == null ? res.message() : "账号校验异常：" + navError) + "，请扫码重新登录");
         }
         return r;
     }

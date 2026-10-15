@@ -135,13 +135,38 @@ public class BiliClient {
             "https://passport.bilibili.com/x/passport-login/web/qrcode/poll?source=main-fe-header&qrcode_key=";
     /** B站网页端自己就在周期调用它来滚动续期登录态；会话未被强制作废时能一直续下去 */
     public static final String COOKIE_REFRESH_URL = "https://passport.bilibili.com/x/passport-login/web/cookie/refresh";
+    /** 续期前置三步：问是否需要续 → 加密时间戳换路径 → 从该页面取一次性刷新口令 */
+    public static final String COOKIE_INFO_URL = "https://passport.bilibili.com/x/passport-login/web/cookie/info";
+    public static final String COOKIE_SUCCESS_URL = "https://passport.bilibili.com/x/passport-login/web/cookie/success";
+    public static final String CORRESPOND_URL = "https://www.bilibili.com/correspond/1/";
+    /** B站 Web 端登录组件内置的续期公钥（JWK modulus，base64url；指数固定 AQAB） */
+    static final String CORRESPOND_KEY_N_B64URL =
+            "y4HdjgJHBlbaBN04VERG4qNBIFHP6a3GozCl75AihQloSWCXC5HDNgyinEnhaQ_4-gaMud_GF50elYXLlCToR9se9Z8z433U3KjM-3Yx7ptKkmQNAMggQwAVKgq3zYAoidNEWuxpkY_mAitTSRLnsJW-NCTa0bqBFF6Wm1MxgfE";
+
+    /** 续期结论分类：把「B站说不用续」和「真的续不动」分开，只有后者才该提示重新扫码 */
+    public enum RefreshOutcome { NOT_NEEDED, ROTATED, NOT_LOGGED_IN, FAILED }
+
+    public record RefreshResult(RefreshOutcome outcome, Map<String, String> cookies,
+                                String refreshToken, String message) {
+        public static RefreshResult notNeeded(String message) {
+            return new RefreshResult(RefreshOutcome.NOT_NEEDED, Map.of(), null, message);
+        }
+
+        public static RefreshResult notLoggedIn(String message) {
+            return new RefreshResult(RefreshOutcome.NOT_LOGGED_IN, Map.of(), null, message);
+        }
+
+        public static RefreshResult failed(String message) {
+            return new RefreshResult(RefreshOutcome.FAILED, Map.of(), null, message);
+        }
+    }
 
     /** 一次扫码会话：key + 待扫 URL + 已画好的 PNG 二维码（data URL，界面直接当 img src 用） */
     public record QrLogin(String qrcodeKey, String url, String imagePng) {
     }
 
-    /** 轮询状态：waiting | scanned | confirmed | canceled | expired */
-    public record QrPoll(String status, String message, Map<String, String> cookies) {
+    /** 轮询状态：waiting | scanned | confirmed | canceled | expired；refreshToken 是后续自动续期的凭证 */
+    public record QrPoll(String status, String message, Map<String, String> cookies, String refreshToken) {
     }
 
     /** 站点首页语境头（passport 接口按浏览器语境校验 Referer/Origin） */
@@ -184,16 +209,16 @@ public class BiliClient {
             resp = rest.exchange(java.net.URI.create(url), HttpMethod.GET,
                     new HttpEntity<>(browserHeaders(null, false)), String.class);
         } catch (RestClientException e) {
-            return new QrPoll("expired", "轮询失败：" + truncate(e.getMessage()), Map.of());
+            return new QrPoll("expired", "轮询失败：" + truncate(e.getMessage()), Map.of(), null);
         }
         JsonNode outer;
         try {
             outer = mapper.readTree(resp.getBody() == null ? "{}" : resp.getBody());
         } catch (Exception e) {
-            return new QrPoll("expired", "轮询响应不是 JSON：" + truncate(resp.getBody()), Map.of());
+            return new QrPoll("expired", "轮询响应不是 JSON：" + truncate(resp.getBody()), Map.of(), null);
         }
         if (outer.path("code").asInt(-999) != 0) {
-            return new QrPoll("expired", "轮询被拒绝：" + outer.path("message").asText(""), Map.of());
+            return new QrPoll("expired", "轮询被拒绝：" + outer.path("message").asText(""), Map.of(), null);
         }
         JsonNode data = outer.path("data");
         int st = data.path("code").asInt(-1);
@@ -202,47 +227,167 @@ public class BiliClient {
         if (st == 0 && !jump.isBlank()) {
             Map<String, String> ck = cookiesOf(resp.getHeaders());
             if (!ck.containsKey("SESSDATA") || !ck.containsKey("bili_jct") || !ck.containsKey("DedeUserID")) {
-                return new QrPoll("expired", "扫码确认成功，但响应里没有登录 Cookie（可能被风控拦下）", ck);
+                return new QrPoll("expired", "扫码确认成功，但响应里没有登录 Cookie（可能被风控拦下）", ck, null);
             }
-            return new QrPoll("confirmed", innerMsg, ck);
+            return new QrPoll("confirmed", innerMsg, ck, data.path("refresh_token").asText(""));
         }
-        if (st == 0) return new QrPoll("waiting", "请在手机上确认", Map.of());
+        if (st == 0) return new QrPoll("waiting", "请在手机上确认", Map.of(), null);
         return switch (st) {
-            case 86101 -> new QrPoll("waiting", "等待扫码：请用哔哩哔哩手机 App 扫这个码", Map.of());
-            case 86090 -> new QrPoll("scanned", "已扫码，请在手机上点「确认登录」", Map.of());
-            case 86097 -> new QrPoll("canceled", "已在手机上取消本次登录，可重新获取二维码", Map.of());
-            case 86096 -> new QrPoll("expired", "二维码已过期，请重新获取", Map.of());
-            case 86038 -> new QrPoll("expired", "该二维码已不可用，请重新获取", Map.of());
+            case 86101 -> new QrPoll("waiting", "等待扫码：请用哔哩哔哩手机 App 扫这个码", Map.of(), null);
+            case 86090 -> new QrPoll("scanned", "已扫码，请在手机上点「确认登录」", Map.of(), null);
+            case 86097 -> new QrPoll("canceled", "已在手机上取消本次登录，可重新获取二维码", Map.of(), null);
+            case 86096 -> new QrPoll("expired", "二维码已过期，请重新获取", Map.of(), null);
+            case 86038 -> new QrPoll("expired", "该二维码已不可用，请重新获取", Map.of(), null);
             default -> new QrPoll("expired",
-                    innerMsg.isEmpty() ? "未知状态 data.code=" + st : innerMsg, Map.of());
+                    innerMsg.isEmpty() ? "未知状态 data.code=" + st : innerMsg, Map.of(), null);
         };
     }
 
     /**
-     * 用当前 Cookie 续期。返回轮换下来的 Cookie（可能只含部分字段）；
-     * 失败（会话已被服务端作废 → -101）返回空 Map，调用方据此提示重新扫码。
+     * 走 B站官方四步握手换发新 Cookie：
+     * cookie/info 问「该续了吗」→ RSA-OAEP 生成 CorrespondPath → correspond 页面取 refresh_csrf
+     * → cookie/refresh 提交拿新 Cookie，最后 cookie/success 用旧令牌确认。
+     *
+     * <p>坑（2026-10-15 实测）：直接空 body POST cookie/refresh 会被拒 {@code -400 请求错误}——
+     * 那是**请求格式**问题，跟会话有没有作废（{@code -101}）无关，绝不能当成"登录失效"提示重新扫码。
+     * 同日实测：第一步 cookie/info 本机可用（当前回 {@code refresh:false}，即还没到换 Cookie 的时候）；
+     * 第三步 correspond 页在本机对**任意** path 都回 B站通用 404 页，属未能实测通过的分支——
+     * 它失败只会降级成"续期没做成"的提示，登录态判定仍由 nav 决定。
      */
-    public Map<String, String> refreshCookies() {
-        if (!cookiesComplete()) return Map.of();
-        String url = COOKIE_REFRESH_URL + "?csrf=" + urlEncode(jct());
+    public RefreshResult refreshSession() {
+        if (!cookiesComplete()) return RefreshResult.failed("未配置 Cookie 三件套");
+        String oldToken = refreshToken();
+        if (oldToken.isBlank()) {
+            return RefreshResult.failed("本机还没保存续期令牌（要在扫码登录那一次才拿得到）");
+        }
+        JsonNode info;
         try {
-            ResponseEntity<String> resp = rest.exchange(java.net.URI.create(url), HttpMethod.POST,
-                    new HttpEntity<>("", browserHeaders(MediaType.APPLICATION_FORM_URLENCODED, true)), String.class);
+            info = getJson(COOKIE_INFO_URL + "?csrf=" + urlEncode(jct()), passportHeaders(null));
+        } catch (RestClientException e) {
+            return RefreshResult.failed("续期检查请求失败：" + truncate(e.getMessage()));
+        }
+        int infoCode = info.path("code").asInt(-999);
+        if (infoCode == -101) return RefreshResult.notLoggedIn("B站判定账号未登录（-101）");
+        if (infoCode != 0) {
+            return RefreshResult.failed("续期检查未通过: code=" + infoCode + " " + info.path("message").asText(""));
+        }
+        if (!info.path("data").path("refresh").asBoolean(false)) {
+            return RefreshResult.notNeeded("B站判定当前无需续期");
+        }
+        long ts = info.path("data").path("timestamp").asLong(System.currentTimeMillis());
+        String refreshCsrf;
+        try {
+            refreshCsrf = fetchCorrespondValue(correspondPath(ts));
+        } catch (Exception e) {
+            return RefreshResult.failed("刷新口令获取失败：" + truncate(e.getMessage()));
+        }
+        if (refreshCsrf == null) return RefreshResult.failed("刷新口令获取失败（correspond 页面没回吐 refresh_csrf）");
+
+        String body = "csrf=" + urlEncode(jct()) + "&refresh_csrf=" + urlEncode(refreshCsrf)
+                + "&source=main_web&refresh_token=" + urlEncode(oldToken);
+        try {
+            ResponseEntity<String> resp = rest.exchange(java.net.URI.create(COOKIE_REFRESH_URL), HttpMethod.POST,
+                    new HttpEntity<>(body, passportHeaders(MediaType.APPLICATION_FORM_URLENCODED)), String.class);
             JsonNode j = mapper.readTree(resp.getBody() == null ? "{}" : resp.getBody());
-            if (j.path("code").asInt(-999) != 0) {
-                log.info("B站 Cookie 续期未通过: code={} message={}", j.path("code").asInt(), j.path("message").asText(""));
-                return Map.of();
+            int code = j.path("code").asInt(-999);
+            if (code == -101) return RefreshResult.notLoggedIn("会话已被 B 站作废（-101）");
+            if (code != 0) {
+                log.info("B站 Cookie 续期未通过: code={} message={}", code, j.path("message").asText(""));
+                return RefreshResult.failed("续期未通过: code=" + code + " " + j.path("message").asText(""));
             }
             Map<String, String> ck = cookiesOf(resp.getHeaders());
             if (!ck.containsKey("SESSDATA")) {
-                log.info("B站 Cookie 续期响应未携带新 SESSDATA，按未变更处理");
-                return Map.of();
+                return RefreshResult.failed("续期响应未携带新 SESSDATA");
             }
-            return ck;
+            String newToken = j.path("data").path("refresh_token").asText("");
+            confirmRefresh(oldToken);
+            return new RefreshResult(RefreshOutcome.ROTATED, ck, newToken.isBlank() ? null : newToken, "已续期");
         } catch (RestClientException | java.io.IOException e) {
-            log.info("B站 Cookie 续期请求失败: {}", truncate(e.getMessage()));
-            return Map.of();
+            return RefreshResult.failed("续期请求失败：" + truncate(e.getMessage()));
         }
+    }
+
+    /** 用**旧**令牌确认本次续期完成。失败只记日志：新 Cookie 此时已经可用，不该因此回退 */
+    private void confirmRefresh(String oldToken) {
+        try {
+            postForm(COOKIE_SUCCESS_URL,
+                    "csrf=" + urlEncode(jct()) + "&refresh_token=" + urlEncode(oldToken));
+        } catch (Exception e) {
+            log.info("B站续期确认接口未通过（不影响新 Cookie）: {}", truncate(e.getMessage()));
+        }
+    }
+
+    private String postForm(String url, String formBody) {
+        ResponseEntity<String> resp = rest.exchange(java.net.URI.create(url), HttpMethod.POST,
+                new HttpEntity<>(formBody, passportHeaders(MediaType.APPLICATION_FORM_URLENCODED)), String.class);
+        return resp.getBody();
+    }
+
+    /** GET correspond 页面，取 &lt;div id="1-name"&gt; 里的 refresh_csrf；取不到返回 null
+     *
+     * <p>2026-10-15 实测：本机对任意 path 都拿到 B站通用 404 页（含乱码真 path），这一条链路只有等
+     * {@code cookie/info} 真判出 {@code refresh=true} 的那天才走得通。因此整段续期是 best-effort：
+     * 失败只让状态徽标保持 nav 的结论，绝不反过来判定"登录失效"。
+     */
+    private String fetchCorrespondValue(String path) {
+        try {
+            ResponseEntity<String> resp = rest.exchange(java.net.URI.create(CORRESPOND_URL + path),
+                    HttpMethod.GET, new HttpEntity<>(passportHeaders(null)), String.class);
+            String html = resp.getBody();
+            if (html == null) return null;
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("id=\"1-name\"[^>]*>([^<]+)<", java.util.regex.Pattern.CASE_INSENSITIVE)
+                    .matcher(html);
+            return m.find() ? m.group(1).trim() : null;
+        } catch (RestClientException e) {
+            log.info("correspond 页面请求失败: {}", truncate(e.getMessage()));
+            return null;
+        }
+    }
+
+    /**
+     * CorrespondPath：把 {@code refresh_{毫秒时间戳}} 用 B站 Web 端公钥做 RSA-OAEP(SHA-256, MGF1-SHA256)
+     * 加密后小写 Base16 编码。Java 的 OAEPWithSHA-256AndMGF1Padding 默认 MGF1 用 SHA-1，必须显式覆盖，
+     * 否则 B站解不开、correspond 页面回空。
+     */
+    static String correspondPath(long timestamp) throws Exception {
+        java.security.spec.RSAPublicKeySpec spec = new java.security.spec.RSAPublicKeySpec(
+                new java.math.BigInteger(1, java.util.Base64.getUrlDecoder().decode(CORRESPOND_KEY_N_B64URL)),
+                new java.math.BigInteger(1, java.util.Base64.getUrlDecoder().decode("AQAB")));
+        javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("RSA/ECB/OAEPPadding");
+        cipher.init(javax.crypto.Cipher.ENCRYPT_MODE,
+                java.security.KeyFactory.getInstance("RSA").generatePublic(spec),
+                new javax.crypto.spec.OAEPParameterSpec("SHA-256", "MGF1",
+                        java.security.spec.MGF1ParameterSpec.SHA256,
+                        javax.crypto.spec.PSource.PSpecified.DEFAULT));
+        byte[] encrypted = cipher.doFinal(("refresh_" + timestamp).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return java.util.HexFormat.of().formatHex(encrypted);
+    }
+
+    /** 从 "k1=v1; k2=v2" 形式的 Cookie 串里取值，取不到返回空串 */
+    static String cookieValueOf(String header, String key) {
+        for (String part : (header == null ? "" : header).split(";")) {
+            String p = part.trim();
+            if (p.startsWith(key + "=")) return p.substring(key.length() + 1).trim();
+        }
+        return "";
+    }
+
+    /** 续期令牌：优先本设置项，其次从完整浏览器 Cookie 的 ac_time_value 里捞（兼容历史登录） */
+    public String refreshToken() {
+        String saved = settings.getStr("bili_refresh_token", "");
+        return saved.isBlank() ? cookieValueOf(settings.getStr("bili_browser_cookie", ""), "ac_time_value") : saved;
+    }
+
+    public void saveRefreshToken(String token) {
+        if (token != null && !token.isBlank()) settings.setValue("bili_refresh_token", token);
+    }
+
+    /** passport 系列接口按浏览器语境校验，Cookie 优先用完整串（含 buvid 指纹），空则退回三件套 */
+    private HttpHeaders passportHeaders(MediaType contentType) {
+        HttpHeaders h = browserHeaders(contentType, true);
+        if (settings.getStr("bili_browser_cookie", "").isBlank()) h.set(HttpHeaders.COOKIE, cookieHeader());
+        return h;
     }
 
     /** 从响应的 Set-Cookie 头里挑出登录相关的 Cookie（值不做日志输出） */
@@ -257,7 +402,7 @@ public class BiliClient {
             String v = pair.substring(eq + 1).trim();
             if (v.isEmpty() || "deleted".equalsIgnoreCase(v) || "0".equals(v)) continue;
             switch (k) {
-                case "SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5", "sid", "buvid3", "bili_ticket" ->
+                case "SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5", "sid", "buvid3", "bili_ticket", "ac_time_value" ->
                         out.put(k, v);
                 default -> {
                 }
@@ -279,6 +424,7 @@ public class BiliClient {
         putIfPresent(ck, "SESSDATA", "bili_sessdata");
         putIfPresent(ck, "bili_jct", "bili_jct");
         putIfPresent(ck, "DedeUserID", "bili_uid");
+        putIfPresent(ck, "ac_time_value", "bili_refresh_token");
         String merged = mergeIntoCookie(settings.getStr("bili_browser_cookie", ""), ck);
         if (!merged.isBlank()) settings.setValue("bili_browser_cookie", merged);
         log.info("B站 Cookie 已更新: uid={} sessdata={} jct={} 完整Cookie键数={}",
