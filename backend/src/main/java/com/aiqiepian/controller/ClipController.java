@@ -28,6 +28,17 @@ import java.util.Map;
 public class ClipController {
 
     private final ClipService clipService;
+    private final com.aiqiepian.service.PipelineService pipeline;
+
+    /**
+     * 整理重复片段：轮播房把同一场录播重录 N 遍时会切出 N 份同样内容的片段。
+     * apply=false（默认）只回报告，apply=true 才删掉后入库的那一条。
+     */
+    @PostMapping("/dedup-sweep")
+    public ApiResponse<Map<String, Object>> dedupSweep(@RequestParam(required = false) Long roomId,
+                                                       @RequestParam(defaultValue = "false") boolean apply) {
+        return ApiResponse.ok(pipeline.dedupSweep(roomId, apply));
+    }
 
     @GetMapping
     public ApiResponse<PageResult<Clip>> list(@RequestParam(required = false) Long sessionId,

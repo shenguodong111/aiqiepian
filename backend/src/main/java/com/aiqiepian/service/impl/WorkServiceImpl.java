@@ -77,6 +77,8 @@ public class WorkServiceImpl implements WorkService {
             String t = BodyUtils.str(body, "title", w.getTitle());
             titleChanged = t != null && !t.equals(w.getTitle());
             w.setTitle(t);
+            // 人工定过的标题要钉住：渲染前的大模型精修不能再把它换掉
+            if (titleChanged) w.setTitleEdited(true);
         }
         if (body.containsKey("description")) w.setDescription(BodyUtils.str(body, "description", w.getDescription()));
         if (body.containsKey("tags")) w.setTags(BodyUtils.str(body, "tags", w.getTags()));

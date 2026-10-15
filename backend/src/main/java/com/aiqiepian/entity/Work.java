@@ -40,6 +40,8 @@ public class Work {
     private String sourcePath;
     /** 高光集锦裁切区间，格式 "start,end;start,end"（秒）；非集锦为 null */
     private String reelSegments;
+    /** 人工改过标题：成片渲染前的大模型标题精修会跳过这类作品，不把用户定的标题换回去 */
+    private Boolean titleEdited;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

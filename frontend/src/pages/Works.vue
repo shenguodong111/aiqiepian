@@ -89,7 +89,7 @@ function openEdit(w) {
   }
 }
 
-async function saveEdit() {
+async function saveEdit(alsoRender = false) {
   const f = editing.value.form
   if (!f.title.trim()) return toast.error('作品标题不能为空')
   const tagCount = f.tags ? f.tags.split(/[,，]/).map(t => t.trim()).filter(Boolean).length : 0
@@ -97,7 +97,12 @@ async function saveEdit() {
   saving.value = true
   try {
     await http.put(`/works/${editing.value.work.id}`, { ...f, title: f.title.trim() })
-    toast.success('作品已保存')
+    if (alsoRender) {
+      await http.post(`/works/${editing.value.work.id}/export`)
+      toast.success('已保存，并按新标题重新剪辑成片（几分钟后可回放）')
+    } else {
+      toast.success('作品已保存')
+    }
     coverTick.value++ // 后端已按新标题重合成封面，让预览穿透缓存
     editing.value = null
     load(true)
@@ -262,6 +267,10 @@ onUnmounted(() => clearInterval(timer))
           <button class="btn sm" :disabled="suggesting" @click="suggestTitle">{{ suggesting ? '生成中…' : 'AI 生成标题' }}</button>
         </div>
         <div v-if="titleHint" class="hint" style="margin-top: 4px">{{ titleHint }}</div>
+        <div v-if="editing.work.output_path" class="hint" style="margin-top: 4px">
+          改名会同步换封面文字；但<b>视频里烧录的标题条</b>是成片渲染那一刻定死的，
+          要让画面里的字也跟着改，请点「保存并重剪成片」。
+        </div>
       </div>
       <label class="field"><span>简介</span><textarea class="input" v-model="editing.form.description" placeholder="支持 {房间} {日期} 等变量文案"></textarea></label>
       <label class="field"><span>标签（逗号分隔，≤10 个）</span><input class="input" v-model="editing.form.tags" placeholder="直播切片,AI剪辑" /></label>
@@ -297,8 +306,9 @@ onUnmounted(() => clearInterval(timer))
       </label>
       <div class="modal-foot">
         <button class="btn ghost" @click="editing = null">取消</button>
+        <button v-if="editing.work.output_path" class="btn" :disabled="saving" @click="saveEdit(true)">保存并重剪成片</button>
         <button v-if="canPublishNow" class="btn" :disabled="saving" @click="saveAndPublish">保存并快速发布</button>
-        <button class="btn primary" :disabled="saving" @click="saveEdit">{{ saving ? '保存中…' : '保存' }}</button>
+        <button class="btn primary" :disabled="saving" @click="saveEdit(false)">{{ saving ? '保存中…' : '保存' }}</button>
       </div>
     </Modal>
 

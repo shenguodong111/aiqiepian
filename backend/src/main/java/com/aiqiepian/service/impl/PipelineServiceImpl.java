@@ -23,8 +23,6 @@ import com.aiqiepian.service.SettingsService;
 import com.aiqiepian.service.TitleGenerator;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,10 +33,11 @@ import java.io.File;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
  * 管线核心状态迁移，逐步对照 mock-server server.mjs：
@@ -75,23 +74,6 @@ public class PipelineServiceImpl implements PipelineService {
 
     private boolean realMode() {
         return "real".equalsIgnoreCase(engineMode);
-    }
-
-    /** 建作品即时返回后，用本地大模型补全标题/简介的后台单线程池（Ollama 串行，无需并发） */
-    private ExecutorService enrichExecutor;
-
-    @PostConstruct
-    void initEnrichExecutor() {
-        enrichExecutor = Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "work-enrich");
-            t.setDaemon(true);
-            return t;
-        });
-    }
-
-    @PreDestroy
-    void shutdownEnrichExecutor() {
-        if (enrichExecutor != null) enrichExecutor.shutdownNow();
     }
 
     @Override
@@ -196,7 +178,7 @@ public class PipelineServiceImpl implements PipelineService {
             dedup = false;
         }
         // 指纹库排除本会话：这一会话的旧候选马上就要被替换，拿它们比对会把新结果整批误判为重复。
-        List<String> knownFp = dedup ? existingFingerprints(s.getRoomId(), s.getId()) : new ArrayList<>();
+        List<KnownClip> known = dedup ? existingSignatures(s.getRoomId(), s.getId()) : new ArrayList<>();
 
         // 旧候选的清除放在"新片段即将入库"这一刻，而不是分析之前：
         // 分析要跑几分钟，先删再算的话一旦这期间进程被关/线程被中断，旧片段没了、新片段也没进来，
@@ -205,21 +187,29 @@ public class PipelineServiceImpl implements PipelineService {
 
         List<Clip> accepted = new ArrayList<>();
         for (Clip c : clips) {
+            long[] frames = null;
             if (dedup) {
                 String fp = ClipFingerprint.compute(source, nz(c.getStartSec()), nz(c.getEndSec()));
-                if (fp != null && matchesAny(fp, knownFp)) {
-                    log.info("片段去重：clip[{}-{}] 与已有片段内容重复，跳过（room={} session={}）",
-                            c.getStartSec(), c.getEndSec(), s.getRoomId(), s.getId());
+                frames = ClipFingerprint.decode(fp);
+                DupHit dup = frames == null ? null : findDuplicate(frames, known);
+                if (dup != null) {
+                    ClipFingerprint.Match m = dup.match();
+                    log.info("片段去重：clip[{}-{}] 与片段 #{}（会话 {}）是同一内容——对齐 {} 秒/重叠 {} 秒、"
+                                    + "轮播平移 {} 秒，跳过（room={} session={}）",
+                            c.getStartSec(), c.getEndSec(), dup.clip().clipId(), dup.clip().sessionId(),
+                            m.matchedSec(), m.overlapSec(), m.shiftSec(), s.getRoomId(), s.getId());
                     continue;
                 }
                 c.setFingerprint(fp);
-                if (fp != null) knownFp.add(fp); // 本批次内后续片段也要与之比对（录制内循环）
             }
             c.setCreatedAt(LocalDateTime.now());
             clipMapper.insert(c);
             c.setFilePath(dir + "/clips/clip_" + c.getId() + ".mp4");
             clipMapper.updateById(c);
             accepted.add(c);
+            if (frames != null) {
+                known.add(new KnownClip(c.getId(), c.getSessionId(), frames)); // 本批次内后续片段也要与之比对
+            }
             // 不再为每个片段自动生成「照搬单片段」的作品；作品统一由下方 makeReelWork 把多个精彩片段
             // 拼接成一支高光集锦成片。片段分析页仍可对任意单个片段手动「生成作品」。
         }
@@ -232,8 +222,18 @@ public class PipelineServiceImpl implements PipelineService {
         return accepted;
     }
 
-    /** 片段去重相似度阈值：>= 此值判为同一段内容 */
-    private static final double DEDUP_SIMILARITY = 0.85;
+    /** 一条已入库/已收下片段的指纹（frames 为逐秒 dHash 序列） */
+    private record KnownClip(Long clipId, Long sessionId, long[] frames) {
+    }
+
+    /** 命中重复：被重复的那个片段 + 对齐结果 */
+    private record DupHit(KnownClip clip, ClipFingerprint.Match match) {
+    }
+
+    /** 去重时回看该房间最近多少条历史片段（轮播一圈通常几百条以内） */
+    private static final int DEDUP_SCAN = 400;
+    /** 一次「整理重复片段」最多扫多少条片段：每条都要抽帧，再多就要跑上几分钟 */
+    private static final int SWEEP_SCAN = 600;
 
     /**
      * 重新分析前先回收该会话上一轮的候选片段：否则旧切片（往往是更早算法产出的等长铺满段）会和
@@ -256,26 +256,125 @@ public class PipelineServiceImpl implements PipelineService {
         if (removed > 0) log.info("重新分析 session={}：清理上一轮候选片段 {} 个", s.getId(), removed);
     }
 
-    /** 该房间历史片段的指纹（最多取最近 3000 条，覆盖轮播循环足够）；excludeSessionId 用于排除即将被替换的本会话旧候选 */
-    private List<String> existingFingerprints(Long roomId, Long excludeSessionId) {
+    /**
+     * 该房间历史片段的 v2 指纹（最近 {@value #DEDUP_SCAN} 条，足够覆盖轮播一整圈）；
+     * excludeSessionId 用于排除即将被替换的本会话旧候选。旧版签名解不开，直接跳过。
+     */
+    private List<KnownClip> existingSignatures(Long roomId, Long excludeSessionId) {
         if (roomId == null) return new ArrayList<>();
         List<Clip> prior = clipMapper.selectList(Wrappers.<Clip>lambdaQuery()
-                .select(Clip::getFingerprint)
+                .select(Clip::getId, Clip::getSessionId, Clip::getFingerprint)
                 .eq(Clip::getRoomId, roomId)
                 .isNotNull(Clip::getFingerprint)
                 .ne(excludeSessionId != null, Clip::getSessionId, excludeSessionId)
                 .orderByDesc(Clip::getId)
-                .last("limit 3000"));
-        List<String> fps = new ArrayList<>(prior.size());
-        for (Clip p : prior) if (p.getFingerprint() != null) fps.add(p.getFingerprint());
-        return fps;
+                .last("limit " + DEDUP_SCAN));
+        List<KnownClip> out = new ArrayList<>(prior.size());
+        for (Clip p : prior) {
+            long[] f = ClipFingerprint.decode(p.getFingerprint());
+            if (f != null) out.add(new KnownClip(p.getId(), p.getSessionId(), f));
+        }
+        return out;
     }
 
-    private static boolean matchesAny(String fp, List<String> known) {
-        for (String k : known) {
-            if (ClipFingerprint.similarity(fp, k) >= DEDUP_SIMILARITY) return true;
+    /** 在已收片段里找与这段内容相同的那一条（取匹配秒数最高的）；没有则 null */
+    private static DupHit findDuplicate(long[] frames, List<KnownClip> known) {
+        DupHit best = null;
+        for (KnownClip k : known) {
+            ClipFingerprint.Match m = ClipFingerprint.align(frames, k.frames());
+            if (!m.duplicate()) continue;
+            if (best == null || m.matchedSec() > best.match().matchedSec()) best = new DupHit(k, m);
         }
-        return false;
+        return best;
+    }
+
+    /**
+     * 整理存量重复片段：按 v2 指纹重新比对一遍，把「后入库的那一条」清掉（先入库的留下，
+     * 因为它可能已经进了集锦）。历史片段的签名是旧算法算的，这里顺手一次性重算。
+     * 只删没人用的：已被作品引用、或已被人工采纳/废弃的片段一律保留，只在报告里说明原因。
+     */
+    @Override
+    public Map<String, Object> dedupSweep(Long roomId, boolean apply) {
+        List<Clip> clips = clipMapper.selectList(Wrappers.<Clip>lambdaQuery()
+                .eq(roomId != null, Clip::getRoomId, roomId)
+                .orderByAsc(Clip::getId)
+                .last("limit " + SWEEP_SCAN));
+        Map<Long, File> sources = new HashMap<>();
+        for (Clip c : clips) {
+            Long sid = c.getSessionId();
+            if (sid == null || sources.containsKey(sid)) continue;
+            RecordingSession s = sessionMapper.selectById(sid);
+            sources.put(sid, s == null ? null : existingFile(s.getFilePath()));
+        }
+        // 按房间分桶比对：轮播重复只可能发生在同一个主播内部，跨房间比对既慢又会误删
+        Map<Long, List<KnownClip>> kept = new HashMap<>();
+        List<Map<String, Object>> groups = new ArrayList<>();
+        int recomputed = 0, deleted = 0, protectedOn = 0, undecided = 0;
+        for (Clip c : clips) {
+            long[] f = ClipFingerprint.decode(c.getFingerprint());
+            if (f == null) {
+                File src = sources.get(c.getSessionId());
+                String sig = src == null ? null
+                        : ClipFingerprint.compute(src, nz(c.getStartSec()), nz(c.getEndSec()));
+                f = ClipFingerprint.decode(sig);
+                if (f != null) {
+                    clipMapper.update(null, Wrappers.<Clip>lambdaUpdate()
+                            .eq(Clip::getId, c.getId())
+                            .set(Clip::getFingerprint, sig));
+                    recomputed++;
+                }
+            }
+            if (f == null) {
+                undecided++; // 录像文件已不在，无从判定：原样保留
+                continue;
+            }
+            if (c.getRoomId() == null) continue;
+            List<KnownClip> roomKept = kept.computeIfAbsent(c.getRoomId(), k -> new ArrayList<>());
+            DupHit dup = findDuplicate(f, roomKept);
+            if (dup == null) {
+                roomKept.add(new KnownClip(c.getId(), c.getSessionId(), f));
+                continue;
+            }
+            boolean used = workMapper.selectCount(Wrappers.<Work>lambdaQuery()
+                    .eq(Work::getClipId, c.getId())) > 0;
+            boolean deletable = !used && "PENDING".equals(c.getStatus());
+            Map<String, Object> g = new LinkedHashMap<>();
+            g.put("clip_id", c.getId());
+            g.put("room_id", c.getRoomId());
+            g.put("room_name", c.getRoomName());
+            g.put("session_id", c.getSessionId());
+            g.put("range", nz(c.getStartSec()) + "-" + nz(c.getEndSec()));
+            g.put("score", c.getScore());
+            g.put("duplicate_of", dup.clip().clipId());
+            g.put("matched_sec", dup.match().matchedSec());
+            g.put("ratio", Math.round(dup.match().ratio() * 100) / 100.0);
+            g.put("deleted", false);
+            g.put("reason", deletable ? "" : (used ? "已有作品引用，保留" : "状态 " + c.getStatus() + "，保留"));
+            if (deletable) {
+                if (apply) {
+                    File cf = existingFile(c.getFilePath());
+                    if (cf != null && !cf.delete()) log.warn("重复片段文件未能删除: {}", cf);
+                    clipMapper.deleteById(c.getId());
+                    g.put("deleted", true);
+                    deleted++;
+                }
+            } else {
+                protectedOn++;
+            }
+            groups.add(g);
+        }
+        log.info("审计整理[重复片段] room={} apply={} 扫描={} 命中重复={} 实删={} 受保护={} 无法判定={} 重算指纹={}",
+                roomId, apply, clips.size(), groups.size(), deleted, protectedOn, undecided, recomputed);
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("scanned", clips.size());
+        m.put("duplicates", groups.size());
+        m.put("deleted", deleted);
+        m.put("protected", protectedOn);
+        m.put("undecided", undecided);
+        m.put("recomputed", recomputed);
+        m.put("apply", apply);
+        m.put("groups", groups);
+        return m;
     }
 
     /**
@@ -335,7 +434,8 @@ public class PipelineServiceImpl implements PipelineService {
         String reelTitle = reelTs.title() != null && !reelTs.title().isBlank()
                 ? reelTs.title() : shortRoomLabel(roomName) + " 高光集锦";
         Work w = new Work();
-        w.setClipId(chosen.get(0).getId());
+        // clip_id 记分数最高的那段（与手工拼接一致）：渲染前的标题/简介精修就是拿它当语境
+        w.setClipId(best.getId());
         w.setRoomId(s.getRoomId());
         w.setRoomName(s.getRoomName());
         w.setTitle(reelTitle);
@@ -359,7 +459,7 @@ public class PipelineServiceImpl implements PipelineService {
         workMapper.updateById(w);
 
         addJob("RENDER", "work", w.getId());
-        enrichWorkAsync(w.getId(), best.getId()); // 与单片段一致：稍后用本地大模型换成三蛆风格标题并补简介
+        // 标题/简介的大模型精修放在渲染前做（见 renderDone）：标题条要烧进画面，必须先定稿
         log.info("高光集锦作品已创建 work={} 段={} 预计={}s（目标 {}s，录制 {}s）",
                 w.getId(), chosen.size(), acc, target, recorded);
     }
@@ -409,7 +509,6 @@ public class PipelineServiceImpl implements PipelineService {
         workMapper.updateById(w);
 
         addJob("RENDER", "work", w.getId());
-        enrichWorkAsync(w.getId(), clip.getId());
         return w;
     }
 
@@ -468,50 +567,70 @@ public class PipelineServiceImpl implements PipelineService {
         workMapper.updateById(w);
 
         addJob("RENDER", "work", w.getId());
-        enrichWorkAsync(w.getId(), best.getId());
         log.info("手工拼接作品已创建 work={} 段={} 预计={}s session={}", w.getId(), ordered.size(), acc, s.getId());
         return w;
     }
 
-    /** ai_mode=local 时后台用大模型精修标题 + 生成投稿简介，只定向更新 title/description（不碰状态/产物），发布后不再改 */
-    private void enrichWorkAsync(long workId, long clipId) {
-        if (!"local".equals(settings.getStr("ai_mode", "mock"))) return;
-        enrichExecutor.submit(() -> {
-            try {
-                Clip clip = clipMapper.selectById(clipId);
-                Work cur = workMapper.selectById(workId);
-                if (clip == null || cur == null || !PRE_PUBLISH.contains(cur.getStatus())) return;
-                TitleGenerator.Result refined = titleGenerator.suggest(clip, true);
-                String aiDesc = titleGenerator.generateDescription(clip, cur.getTitle());
-                LambdaUpdateWrapper<Work> upd = Wrappers.<Work>lambdaUpdate()
-                        .eq(Work::getId, workId)
-                        .set(Work::getUpdatedAt, LocalDateTime.now());
-                boolean changed = false;
-                if (!"generic".equals(refined.kind())
-                        && refined.title() != null && !refined.title().isBlank()) {
-                    upd.set(Work::getTitle, refined.title());
-                    changed = true;
-                }
-                if (aiDesc != null && !aiDesc.isBlank()) {
-                    upd.set(Work::getDescription, aiDesc);
-                    changed = true;
-                }
-                if (changed) workMapper.update(null, upd);
-            } catch (Exception e) {
-                log.warn("作品后台补全标题/简介失败 work={}: {}", workId, e.toString());
+    /**
+     * ai_mode=local 时用大模型精修标题 + 生成投稿简介，只定向更新 title/description（不碰状态/产物）。
+     *
+     * <p>必须在渲染<b>之前</p>跑完：标题条是烧进画面里的，渲染完就再也改不动了。过去这一句挂在
+     * 建作品之后异步执行，渲染几分钟里谁先谁后全凭运气，实测就出现过「视频里烧的是规则标题、
+     * 稿件标题却是大模型标题」的两套标题。人工改过标题的作品（title_edited）不再精修，
+     * 免得把用户定的名字换回去。
+     */
+    private void enrichWork(long workId, Long clipId) {
+        if (!"local".equals(settings.getStr("ai_mode", "mock")) || clipId == null) return;
+        try {
+            Clip clip = clipMapper.selectById(clipId);
+            Work cur = workMapper.selectById(workId);
+            if (clip == null || cur == null || !PRE_PUBLISH.contains(cur.getStatus())) return;
+            boolean lockTitle = Boolean.TRUE.equals(cur.getTitleEdited());
+            TitleGenerator.Result refined = titleGenerator.suggest(clip, true);
+            String newTitle = lockTitle || "generic".equals(refined.kind())
+                    || refined.title() == null || refined.title().isBlank()
+                    ? cur.getTitle() : refined.title();
+            String aiDesc = titleGenerator.generateDescription(clip, newTitle);
+            LambdaUpdateWrapper<Work> upd = Wrappers.<Work>lambdaUpdate()
+                    .eq(Work::getId, workId)
+                    .set(Work::getUpdatedAt, LocalDateTime.now());
+            boolean changed = false;
+            if (!newTitle.equals(cur.getTitle())) {
+                upd.set(Work::getTitle, newTitle);
+                changed = true;
             }
-        });
+            if (aiDesc != null && !aiDesc.isBlank()) {
+                upd.set(Work::getDescription, aiDesc);
+                changed = true;
+            }
+            if (changed) workMapper.update(null, upd);
+        } catch (Exception e) {
+            log.warn("作品渲染前补全标题/简介失败 work={}: {}", workId, e.toString());
+        }
     }
 
     @Override
     public void renderDone(Work w) {
+        // 先把标题定稿再渲染：成片画面里烧的就是这个标题，两边必须是同一个值
+        enrichWork(w.getId(), w.getClipId());
+        Work fresh = workMapper.selectById(w.getId());
+        if (fresh != null) w.setTitle(fresh.getTitle());
         String out = renderer.render(w).getOutputPath();
+        // 渲染器在源录制缺失/剪辑失败时只会返回一个"占位路径"，磁盘上其实没有文件。
+        // 以前照样标 READY、job 报成功，于是界面显示"待审片"却永远播不出东西（实测 work=1016 的源录像被删过）。
+        if (realMode() && existingFile(out) == null) {
+            workMapper.update(null, Wrappers.<Work>lambdaUpdate()
+                    .eq(Work::getId, w.getId())
+                    .set(Work::getStatus, "DRAFT")
+                    .set(Work::getUpdatedAt, LocalDateTime.now()));
+            throw new BizException("成片未产出文件：这一支要剪的源录制已不在磁盘上（素材库里删过这场录像），"
+                    + "作品已退回草稿，请换一段还有录像的片段重新生成");
+        }
         // 实测成片长度：集锦由多段拼成，界面若拿单片段时长显示会严重偏小（实测 420s 的集锦显示成 1 分钟）
         int dur = renderer.probeDurationSec(out);
         LocalDateTime now = LocalDateTime.now();
-        // 只写自己这几列，别用 updateById 回写整行：渲染要吃掉几分钟，这期间 enrichWorkAsync
-        // 可能已经把标题/简介换成大模型版本，拿渲染前读到的旧快照整行覆盖就会把精修结果打回
-        // 规则标题（实测发出去的稿件标题退成了"主播 决胜时刻名场面"）。
+        // 只写自己这几列，别用 updateById 回写整行：渲染要吃掉几分钟，这期间用户可能已经在审片页
+        // 改了标题，拿渲染前读到的旧快照整行覆盖就会把改名结果打回（实测发出去的稿件标题退成了规则标题）。
         workMapper.update(null, Wrappers.<Work>lambdaUpdate()
                 .eq(Work::getId, w.getId())
                 .set(Work::getStatus, "READY")

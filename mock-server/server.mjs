@@ -453,6 +453,9 @@ const server = http.createServer(async (req, res) => {
   if (api === '/clips/batch-make-work' && req.method === 'POST') {
     const made = (body.ids || []).map(id => findClip(id)).filter(c => c && c.status === 'PENDING' && !analyzing(c.session_id)).map(c => { c.status = 'RENDERED'; return makeWork(c, false) })
     return ok(res, made) }
+  // 整理重复片段：mock 片段是随机造的，不存在"同一段被重播"，因此恒为 0 组
+  if (api === '/clips/dedup-sweep' && req.method === 'POST') {
+    return ok(res, { scanned: db.clips.length, duplicates: 0, deleted: 0, protected: 0, undecided: 0, recomputed: 0, apply: q.apply === 'true', groups: [] }) }
   // 作品
   if (req.method === 'GET' && api === '/works') {
     let list = [...db.works].reverse()

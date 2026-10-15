@@ -8,6 +8,7 @@ import com.aiqiepian.entity.RecordingSession;
 import com.aiqiepian.entity.Work;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * 管线核心状态迁移（逻辑对照 mock-server server.mjs，controller 与 PipelineOrchestrator 共用）。
@@ -22,6 +23,13 @@ public interface PipelineService {
 
     /** server.mjs analyzeDone：analyze_status=DONE，落库 3-8 个 clip，高分自动建 work */
     List<Clip> applyAnalysis(RecordingSession session);
+
+    /**
+     * 整理存量重复片段（轮播房同一场录播被反复重录时会产生）：按 v2 内容指纹重新比对，
+     * 命中重复则删掉后入库的那一条。apply=false 只出报告不动数据。
+     * 返回 {scanned, duplicates, deleted, protected, undecided, recomputed, apply, groups[]}。
+     */
+    Map<String, Object> dedupSweep(Long roomId, boolean apply);
 
     /** server.mjs makeWork：建 DRAFT 作品并入队 RENDER job */
     Work makeWork(Clip clip);

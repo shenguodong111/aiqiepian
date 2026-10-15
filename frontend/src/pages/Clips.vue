@@ -179,6 +179,39 @@ async function analyzeSession() {
   } catch { /* http 已 toast */ }
 }
 
+const dedupBusy = ref(false)
+const dedupReport = ref(null)
+
+/**
+ * 整理重复片段：轮播房把同一场录播重录 N 遍时，会切出 N 份画面内容相同的片段。
+ * 先拿 apply=false 要一份预告，确认后再真删（只删后入库、且没被作品引用的那一条）。
+ */
+async function dedupSweep() {
+  if (dedupBusy.value) return
+  dedupBusy.value = true
+  const params = filters.roomId ? { roomId: filters.roomId } : {}
+  try {
+    const p = await http.post('/clips/dedup-sweep', undefined, { params })
+    if (!p.duplicates) {
+      toast.info(p.scanned ? `比对完成：${p.scanned} 条片段里没有内容重复的` : '该主播下还没有片段可比对')
+      return
+    }
+    const willDelete = p.duplicates - p.protected
+    if (!willDelete) {
+      dedupReport.value = p
+      toast.info(`发现 ${p.duplicates} 条重复，但都已有作品引用或已被人工处理，未删除`)
+      return
+    }
+    if (!window.confirm(`发现 ${p.duplicates} 条与其它片段画面内容相同的片段（轮播重播同一段）。\n`
+      + `将删除其中 ${willDelete} 条后入库的，保留先入库的那条；`
+      + `${p.protected} 条因已有作品引用或已被人工标记而保留。\n现在执行？`)) return
+    const r = await http.post('/clips/dedup-sweep', undefined, { params: { ...params, apply: true } })
+    dedupReport.value = r
+    toast.success(`已删除 ${r.deleted} 条重复片段${r.recomputed ? ` · 重算指纹 ${r.recomputed} 条` : ''}`)
+    load(true)
+  } catch { /* http 已 toast */ } finally { dedupBusy.value = false }
+}
+
 // 弹幕热度迷你柱：由热度值确定性生成
 function heatBars(heat) {
   const bars = []
@@ -274,6 +307,7 @@ function sessionTotalSec(id) {
         <option value="DISCARDED">已丢弃</option>
       </select>
       <button v-if="filters.sessionId" class="btn" @click="analyzeSession">重新分析该录像</button>
+      <button class="btn" :disabled="dedupBusy" @click="dedupSweep">{{ dedupBusy ? '比对中…' : '整理重复片段' }}</button>
       <span style="flex: 1"></span>
       <span v-if="checked.size" class="hint stitch-hint">
         已选 {{ checked.size }} 段 · 约 {{ fmtDuration(stitchSpan) }}
@@ -384,6 +418,32 @@ function sessionTotalSec(id) {
       </div>
     </Modal>
 
+    <!-- 整理重复片段的结果明细：删了谁、和谁重复、为什么有的没删 -->
+    <Modal v-if="dedupReport" title="重复片段整理结果" @close="dedupReport = null">
+      <p class="hint" style="margin-bottom: 12px">
+        共比对 {{ dedupReport.scanned }} 条 · 命中重复 {{ dedupReport.duplicates }} 条 ·
+        已删除 {{ dedupReport.deleted }} 条 · 保留不动 {{ dedupReport.protected }} 条 ·
+        录像已不在无法判定 {{ dedupReport.undecided }} 条
+      </p>
+      <table class="table dedup-table">
+        <thead>
+          <tr><th>片段</th><th>起止</th><th>与哪条重复</th><th>对齐时长</th><th>处理</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="g in dedupReport.groups" :key="g.clip_id">
+            <td class="num">#{{ g.clip_id }}<span class="hint">（会话 #{{ g.session_id }}）</span></td>
+            <td class="num">{{ fmtDuration(g.range.split('-')[0]) }}–{{ fmtDuration(g.range.split('-')[1]) }}</td>
+            <td class="num">#{{ g.duplicate_of }}</td>
+            <td class="num">{{ g.matched_sec }}s / 相似度 {{ g.ratio }}</td>
+            <td><span v-if="g.deleted" class="badge green">已删除</span><span v-else class="badge orange">{{ g.reason || '未执行（仅预览）' }}</span></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="modal-foot">
+        <button class="btn primary" @click="dedupReport = null">知道了</button>
+      </div>
+    </Modal>
+
     <!-- 片段播放预览（成片优先，回落原始录制） -->
     <MediaPlayer v-if="playClip" type="clip" :id="playClip.id" :label="`片段预览 #${playClip.id} · ${fmtDuration(playClip.start_sec)}–${fmtDuration(playClip.end_sec)}`" @close="playClip = null" />
   </div>
@@ -399,6 +459,8 @@ function sessionTotalSec(id) {
 .ai-reason { color: var(--text-2); font-size: 12.5px; max-width: 130px; display: inline-block; }
 td input[type='checkbox'] { accent-color: var(--accent); width: 14px; height: 14px; cursor: pointer; }
 .time-inputs { display: flex; align-items: flex-end; gap: 10px; }
+.dedup-table { width: 100%; }
+.dedup-table th, .dedup-table td { font-size: 12.5px; white-space: nowrap; }
 /* 同一场录像的分组头：让"哪些片段属于同一场"在挑段拼接时一眼可辨 */
 .group-row td {
   background: var(--surface-2, rgba(255 255 255 / 4%));

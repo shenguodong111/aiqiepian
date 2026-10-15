@@ -184,3 +184,10 @@ CREATE TABLE IF NOT EXISTS cover_asset (
 ALTER TABLE work ADD COLUMN IF NOT EXISTS duration_sec INT;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS room_id BIGINT;
 ALTER TABLE work ADD COLUMN IF NOT EXISTS cover_image VARCHAR(500);
+
+-- ---------- 轮播去重 v2：逐秒 dHash 序列签名（最长 400 帧 × 8 字节 = 6400 十六进制字符 + 前缀） ----------
+-- 旧版 8 帧平均哈希只要 128 字符，500 够用；v2 要存整条序列，必须加宽。
+ALTER TABLE clip ALTER COLUMN fingerprint SET DATA TYPE VARCHAR(6600);
+
+-- ---------- 成片标题条与稿件标题一致：人工改过标题的作品不再被大模型精修覆盖 ----------
+ALTER TABLE work ADD COLUMN IF NOT EXISTS title_edited BOOLEAN;
