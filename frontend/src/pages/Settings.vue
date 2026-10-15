@@ -49,6 +49,8 @@ const form = reactive({
   ai_mode: 'mock',
   ai_local_url: '',
   ai_local_model: '',
+  analyze_vision: false,
+  ai_vision_model: '',
   ai_agent_cmd: '',
   ai_cloud_url: '',
   ai_cloud_model: '',
@@ -60,6 +62,7 @@ const form = reactive({
   asr_model: 'small',
   asr_language: 'zh',
   asr_python: '',
+  asr_hotwords: '',
   danmu_python: '',
   media_dir: './media',
   keep_days: 30,
@@ -266,12 +269,24 @@ onUnmounted(stopQrPoll)
           <p v-else class="hint">不接大模型也能跑：标题用「房间名 + 战队 VS + 时刻」或高频弹幕汇总规则生成，简介用设置里的模板填充。想升级为本地大模型精修，选上方「本地模型」并填 URL。</p>
         </div>
 
+        <!-- 画面理解（视觉模型） -->
+        <div class="card group">
+          <div class="group-title">画面理解（本地视觉模型） <span class="badge cyan" style="margin-left: 8px">{{ form.analyze_vision ? '已开启' : '已关闭' }}</span></div>
+          <label class="check-line top-line">
+            <label class="switch"><input type="checkbox" v-model="form.analyze_vision" /><span class="track"></span></label>
+            <span>选段时抽几帧给视觉模型看，让它判断"画面上正在发生什么、值不值得剪"，并把这个判断算进片段评分</span>
+          </label>
+          <label class="field"><span>视觉模型名称</span><input class="input" v-model="form.ai_vision_model" placeholder="qwen3-vl:4b" /></label>
+          <p class="hint">画面理解不走上方的文本模型，但共用同一个 Ollama 地址，所以要本机先起着 Ollama 并拉好这个视觉模型；名字不在本机清单里、或连不上服务，这一路会自动跳过，分析照常出片段。</p>
+          <p class="hint">代价：每个候选片段要问模型一次（本机实测 8 秒上下），一段长直播的候选有十几个，分析会明显变慢；视觉模型和文案模型也不能同时待在显存里，开着它会把 <span>{{ form.ai_local_model || 'qwen2.5:3b' }}</span> 挤下去，下一步生成标题时会重新加载。建议先用一场真实录制对比开关前后的选段质量，再决定要不要常开。</p>
+        </div>
+
         <!-- 语音字幕 ASR -->
         <div class="card group">
           <div class="group-title">语音字幕（本地 ASR） <span class="badge cyan" style="margin-left: 8px">{{ form.asr_enabled ? '已开启' : '已关闭' }}</span></div>
           <label class="check-line top-line">
             <label class="switch"><input type="checkbox" v-model="form.asr_enabled" /><span class="track"></span></label>
-            <span>成片时自动识别语音并烧录字幕（真实引擎生效；无语音则只保留标题条）</span>
+            <span>成片时自动识别语音并烧录字幕（真实引擎生效；无语音或识别失败则不加字幕）</span>
           </label>
           <p class="hint">基于本机 faster-whisper 离线转写，无需联网。B 站 / 斗鱼 / 虎牙录制的语音均可识别。</p>
           <div class="form-2col">
@@ -280,6 +295,9 @@ onUnmounted(stopQrPoll)
           </div>
           <label class="field"><span>Python 解释器（可选）</span><input class="input" v-model="form.asr_python" placeholder="留空 = 自动探测 PATH 上的 python / py" /></label>
           <p class="hint">需要本机装有 faster-whisper。留空时程序会自己试 python、py 两个命令；装在别处就填完整的 python.exe 路径。</p>
+          <label class="field"><span>识别热词（可选）</span><input class="input" v-model="form.asr_hotwords" placeholder="主播名、英雄名、直播间黑话，逗号分隔" /></label>
+          <p class="hint">字幕按逐词时间轴重切：一句话不劈成两条，一行不超过画面放得下的字数（竖屏会自动变短），最多两行；置信度太低的段落直接丢掉，宁缺不滥。房间名和主播名已经自动作为热词，这里只补充那些常被听成同音词的专有名词——写全角逗号也行。</p>
+          <p class="hint">错别字仍然可能出现：本机跑的是 <span>{{ form.asr_model || 'small' }}</span> 这个量级的小模型，想明显更准可以把「识别模型」改成 <span>medium</span>（首次运行会下载约 1.5GB，CPU 上慢 3–4 倍）。识别不了的静音段、纯 BGM 段不会硬凑字幕。</p>
         </div>
 
         <!-- 斗鱼弹幕通道 -->

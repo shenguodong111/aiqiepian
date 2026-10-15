@@ -34,3 +34,7 @@ desktop.ini
 .idea/
 .vscode/
 *.iml
+
+# ---- Python 缓存（scripts/*.py 旁路脚本跑出来的）----
+__pycache__/
+*.pyc

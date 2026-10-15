@@ -40,8 +40,9 @@ public class SettingsServiceImpl implements SettingsService, ApplicationRunner {
     /** 非设置项的内部 KV 键（不出现在 GET /settings 响应中） */
     public static final String KEY_PUBLISH_ACCOUNT = "publish_account";
 
-    /** M3 敏感设置（Cookie 三件套）：GET 返回时掩码，PUT 收到掩码值不覆盖真实值；配置导出时整体剔除 */
-    public static final Set<String> SENSITIVE_KEYS = Set.of("bili_sessdata", "bili_jct", "bili_uid", "bili_browser_cookie");
+    /** M3 敏感设置（Cookie 三件套 + 续期令牌）：GET 返回时掩码，PUT 收到掩码值不覆盖真实值；配置导出时整体剔除 */
+    public static final Set<String> SENSITIVE_KEYS = Set.of("bili_sessdata", "bili_jct", "bili_uid",
+            "bili_browser_cookie", "bili_refresh_token");
 
     /** 有序默认设置，键与 server.mjs db.settings 一一对应 */
     private static final Map<String, Object> DEFAULTS = buildDefaults();
@@ -91,6 +92,10 @@ public class SettingsServiceImpl implements SettingsService, ApplicationRunner {
         m.put("ai_mode", "mock");
         m.put("ai_local_url", "http://localhost:11434");
         m.put("ai_local_model", "qwen2.5:3b");
+        // ---- 画面高光增强（本机多模态模型抽帧判读，engine.mode=real 生效）----
+        // 默认关：一个候选窗口要问模型 8–15 秒，开与不开选段结果差别要拿真实录制量过一次才敢默认打开
+        m.put("analyze_vision", false);
+        m.put("ai_vision_model", "qwen3-vl:4b");
         // ---- 本地语音 ASR 字幕（faster-whisper，engine.mode=real 生效）----
         m.put("asr_enabled", true);
         // 留空 = AsrClient 逐个探测 PATH 上的 python/py；换机器不需要改这里
@@ -99,6 +104,8 @@ public class SettingsServiceImpl implements SettingsService, ApplicationRunner {
         m.put("asr_language", "zh");
         m.put("asr_device", "cpu");
         m.put("asr_compute", "int8");
+        // 额外热词（主播名/英雄名/黑话），逗号分隔；房间名与主播名会自动带上，这里只填补充词
+        m.put("asr_hotwords", "");
         // ---- 斗鱼弹幕采集旁路（scripts/douyu-danmu.py，engine.mode=real 生效）----
         // 留空 = 依次探测 danmu_python → asr_python → PATH 上的 python/py；判定标准是能 import websocket
         m.put("danmu_python", "");

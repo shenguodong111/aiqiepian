@@ -1,5 +1,6 @@
 package com.aiqiepian.engine.real;
 
+import com.aiqiepian.common.SessionFiles;
 import com.aiqiepian.engine.Analyzer;
 import com.aiqiepian.entity.Clip;
 import com.aiqiepian.entity.LiveRoom;
@@ -72,6 +73,8 @@ public class RealAnalyzer implements Analyzer {
     private final LocalLlmClient llm;
     /** 可选增强：无弹幕时用本地 ASR 语音活动(VAD)识别"主播在说话"窗口，融入选段评分 */
     private final AsrClient asr;
+    /** 可选增强：抽帧给本机多模态模型判读画面内容（analyze_vision 开关） */
+    private final VisionScorer vision;
 
     @Override
     public List<Clip> analyze(RecordingSession session) {
@@ -111,6 +114,11 @@ public class RealAnalyzer implements Analyzer {
                 log.info("真实分析 session={}：语音硬门槛生效，含说话窗口 {}/{}，选段 {}",
                         session.getId(), talkable, windows.size(), picked.size());
             }
+
+            // 画面高光增强（analyze_vision 开关）：抽帧问本机多模态模型，把"画面上到底在发生什么"
+            // 作为第四个信号融进评分。放在这里而不是滑窗阶段，是因为滑窗有几百个，
+            // 每个都问一次模型一场长直播要跑几小时；只问已经选出的候选（几条到十几条）。
+            applyVision(source, picked, session.getRoomName());
 
             // 本地大模型增强：对候选高光重排 + 自然理由（不可用/失败静默回退启发式顺序与理由）
             boolean llmReranked = false;
@@ -154,6 +162,47 @@ public class RealAnalyzer implements Analyzer {
             log.warn("真实分析异常，降级返回已产出片段（{} 个）: {}", clips.size(), e.toString());
         }
         return clips;
+    }
+
+    // ---------- 画面高光增强通道 ----------
+
+    /**
+     * 画面信号在融合评分里的权重：其余三个信号等比缩到 0.75，保持它们之间的相对关系不变
+     * （响度/场景/弹幕权重是调过的，不能被一个通道整体挤掉）。
+     */
+    static final double VISION_WEIGHT = 0.25;
+
+    /**
+     * 给已选出的候选窗口做画面判读并融入 {@code w.base}。整通道只在开关打开且模型就位时跑；
+     * 拿不到判读的窗口用成功窗口的均值补（否则"模型没答上来"的窗口会用未混合的原始分
+     * 跟"被判低分"的窗口比高低，等于惩罚运气）。
+     */
+    void applyVision(File source, List<Window> picked, String roomName) {
+        if (picked.isEmpty() || !vision.usable()) return;
+        List<double[]> ranges = new ArrayList<>();
+        for (Window w : picked) ranges.add(new double[]{w.start, w.end});
+        List<VisionScorer.Result> judged = vision.score(source, ranges, roomName);
+
+        List<Double> got = new ArrayList<>();
+        for (int i = 0; i < picked.size() && i < judged.size(); i++) {
+            VisionScorer.Result r = judged.get(i);
+            if (r == null) continue;
+            Window w = picked.get(i);
+            w.visionNorm = Math.max(0, Math.min(1, r.score() / 100.0));
+            w.visionJudged = true;
+            w.visionNote = r.subject().isBlank() ? null : r.subject();
+            got.add(w.visionNorm);
+        }
+        if (got.isEmpty()) {
+            log.info("画面高光增强：候选 {} 个全部判读失败，本次仅用音频/画面启发式", picked.size());
+            return;
+        }
+        double imputed = got.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+        for (Window w : picked) {
+            w.base = (1 - VISION_WEIGHT) * w.base + VISION_WEIGHT * (w.visionJudged ? w.visionNorm : imputed);
+        }
+        log.info("画面高光增强：{} 个候选，模型判读命中 {} 个，均值 {}，权重 {}",
+                picked.size(), got.size(), String.format("%.2f", imputed), VISION_WEIGHT);
     }
 
     // ---------- 主通道 a：响度曲线（ebur128 瞬时响度 M:） ----------
@@ -349,6 +398,12 @@ public class RealAnalyzer implements Analyzer {
         double heatNorm;
         /** 窗口内"主播在说话"时长占比（语音活动覆盖），无弹幕场景的主选段信号 */
         double speechCov;
+        /** 本机多模态模型给的画面精彩度（0..1），画面通道未启用时保持 0 */
+        double visionNorm;
+        /** 该窗口是否真的拿到了画面判读（0 分也是有效判读，不能拿 visionNorm 当标志） */
+        boolean visionJudged;
+        /** 模型对画面内容的一句话判读，用于把"画面上在放什么"写进 ai_reason */
+        String visionNote;
         double base;
         /** 本地大模型给出的自然理由（重排成功时填充，否则 null 回退启发式文案） */
         String llmReason;
@@ -523,6 +578,9 @@ public class RealAnalyzer implements Analyzer {
         if (w.heat > 0) {
             parts.add(String.format("弹幕互动活跃（窗口内 %d 条）", w.heat));
         }
+        if (w.visionNote != null) {
+            parts.add("画面判读：" + w.visionNote);
+        }
         if (parts.isEmpty()) {
             parts.add(String.format("相对全片综合能量居前（区间 %.0f-%.0f 秒）", w.start, w.end));
         }
@@ -533,6 +591,11 @@ public class RealAnalyzer implements Analyzer {
     }
 
     // ---------- 本地大模型增强：候选高光重排 + 自然理由 ----------
+
+    /** 候选里是否有任何一条带画面判读（决定重排提示词要不要提"画面"这一路信号） */
+    private static boolean anyVisionNote(List<Window> picked) {
+        return picked.stream().anyMatch(w -> w.visionNote != null);
+    }
 
     /**
      * 把候选窗口的客观信号（响度峰值/场景密度/弹幕热度+高频弹幕）交给本地大模型，
@@ -552,9 +615,16 @@ public class RealAnalyzer implements Analyzer {
                     .append("，弹幕").append(w.heat).append("条");
             String top = topWords(w, dm, 3);
             if (!top.isEmpty()) list.append("，高频弹幕[").append(top).append("]");
+            // 画面通道判读出来的"这段在放什么"是文本模型唯一能拿到的视觉信息，给它比给它分数有用
+            if (w.visionNote != null) {
+                list.append("，画面[").append(w.visionNote).append("]")
+                        .append("（画面精彩度").append(String.format("%.0f", w.visionNorm * 100)).append(")");
+            }
             list.append('\n');
         }
-        String prompt = "你是直播高光剪辑助手。依据音频响度、场景切换密度、弹幕互动热度，对候选高光片段按精彩程度从高到低排序，"
+        String prompt = "你是直播高光剪辑助手。依据音频响度、场景切换密度、弹幕互动热度"
+                + (anyVisionNote(picked) ? "和画面判读（画面[...] 与画面精彩度，来自多模态模型看帧后的结论，权重最高）" : "")
+                + "，对候选高光片段按精彩程度从高到低排序，"
                 + "并为每条写不超过15字的中文精彩理由。只输出 JSON，结构为 "
                 + "{\"items\":[{\"index\":编号,\"reason\":\"理由\"}]}，items 按精彩度先后排列，编号为候选编号。\n\n"
                 + "直播标题：" + nz(title) + "\n候选片段（每行一个）：\n" + list;
@@ -630,10 +700,17 @@ public class RealAnalyzer implements Analyzer {
 
     // ---------- 工具 ----------
 
+    /**
+     * 会话可用的分析源：最终文件优先；它还不存在时（录制被强杀、遗留分片没合并成功）退到最后一段分段。
+     * 退到分段意味着只分析那一段，日志里写清楚——总比整条素材对分析"隐形"、直接返回空片段好。
+     */
     private static File resolveSource(RecordingSession session) {
-        if (session.getFilePath() == null || session.getFilePath().isBlank()) return null;
-        File f = new File(session.getFilePath());
-        return f.isFile() && f.length() > 0 ? f : null;
+        File playable = SessionFiles.playable(session.getFilePath());
+        if (playable == null) return null;
+        if (!playable.getAbsolutePath().equals(new File(session.getFilePath()).getAbsolutePath())) {
+            log.warn("真实分析：会话 {} 的最终文件缺失，改用遗留分段 {}", session.getId(), playable);
+        }
+        return playable;
     }
 
     /** 分析超时随文件长度伸缩：至少 120s，最多 15 分钟 */
